@@ -59,3 +59,7 @@ Route `/api/*` on your Pages domain to the `krill-api` Worker. See [worker/READM
 - **Network:** Robinhood Chain (EVM)
 - **Chain ID:** 4663
 - **Token:** $KRILL (Virtuals Protocol)
+
+## License
+
+[MIT](LICENSE) © KRILL
