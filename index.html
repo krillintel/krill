@@ -65,6 +65,7 @@
     <nav aria-label="Sections">
       <a href="#how">How it works</a>
       <a href="#example">Example</a>
+      <a href="#try">Try it</a>
       <a href="#why">Why KRILL</a>
       <a href="terminal.html">Terminal</a>
     </nav>
@@ -241,6 +242,58 @@
       </article>
     </section>
 
+    <!-- LIVE SCORER — try the agent right here -->
+    <section class="scorer" id="try">
+      <div class="section-intro">
+        <p class="eyebrow">Try it live</p>
+        <h2>Score any launch in seconds.</h2>
+        <p>Type a token symbol or address and let KRILL pull a live clarity score, signal breakdown, and verdict.</p>
+      </div>
+
+      <form class="scorer-form" id="scorerForm" autocomplete="off">
+        <input
+          class="scorer-input"
+          id="scorerInput"
+          type="text"
+          placeholder="$KRILL or 0x…"
+          aria-label="Token symbol or address"
+          maxlength="64"
+          value="$KRILL"
+        >
+        <button class="btn scorer-btn" id="scorerBtn" type="submit">Score it</button>
+      </form>
+
+      <div class="scorer-result" id="scorerResult" hidden>
+        <div class="scorer-card">
+          <header class="report-head">
+            <div>
+              <p class="report-label">Live clarity report</p>
+              <h3 id="scorerToken">$KRILL</h3>
+            </div>
+            <div class="score" aria-label="Clarity score" id="scorerScoreWrap">
+              <svg viewBox="0 0 120 120" class="score-ring">
+                <circle cx="60" cy="60" r="52" class="track"/>
+                <circle cx="60" cy="60" r="52" class="value" id="scorerRing" pathLength="100" style="stroke-dasharray: 0 100;"/>
+              </svg>
+              <div class="score-num">
+                <strong id="scorerScore">—</strong>
+                <span>clarity</span>
+              </div>
+            </div>
+          </header>
+
+          <p class="scorer-verdict" id="scorerVerdict">
+            <span class="verdict-badge" id="scorerBadge">—</span>
+            <span id="scorerVerdictText">Waiting for signal…</span>
+          </p>
+
+          <div class="scorer-signals" id="scorerSignals"></div>
+
+          <p class="scorer-note">Signals are generated live by the KRILL agent. This is intelligence, not financial advice.</p>
+        </div>
+      </div>
+    </section>
+
     <!-- WHY -->
     <section class="why" id="why">
       <div class="section-intro">
@@ -285,7 +338,7 @@
        here and redeploy. Leave CA empty ('') to show "Launching soon".
        ───────────────────────────────────────────────────────────── */
     window.KRILL_CA = '0x9D08407b8511249bec898856C506dD7c5972E7BB';
-    window.KRILL_TRADE_URL = 'https://app.virtuals.io/virtuals/token/0x9D08407b8511249bec898856C506dD7c5972E7BB';
+    window.KRILL_TRADE_URL = 'https://app.virtuals.io/virtuals/112988';
 
     // Shared API base for all live data fetches
     window.KRILL_API_BASE = location.hostname === 'krill.live' ? '/api' :
@@ -408,8 +461,100 @@
       setInterval(pollFeed, 10000); // poll every 10s
     })();
 
+    /* ── LIVE SCORER: fetch a clarity score for any token ── */
     (function () {
-      const items = document.querySelectorAll('.step, .report, .why-grid, .close');
+      const form = document.getElementById('scorerForm');
+      const input = document.getElementById('scorerInput');
+      const btn = document.getElementById('scorerBtn');
+      const result = document.getElementById('scorerResult');
+      const tokenEl = document.getElementById('scorerToken');
+      const scoreEl = document.getElementById('scorerScore');
+      const ring = document.getElementById('scorerRing');
+      const badge = document.getElementById('scorerBadge');
+      const verdictText = document.getElementById('scorerVerdictText');
+      const signalsEl = document.getElementById('scorerSignals');
+      if (!form) return;
+
+      const API = window.KRILL_API_BASE;
+      const VERDICTS = {
+        SIGNAL: { text: 'Readable and coherent. Clear enough to understand fast.', cls: 'good' },
+        SCAN: { text: 'Mixed signals. Worth a closer look before acting.', cls: 'warn' },
+        SKIP: { text: 'Confusing or risky. Hard to verify the story.', cls: 'bad' },
+      };
+
+      function labelize(name) {
+        return name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      }
+
+      function animateScore(target) {
+        let cur = 0;
+        const step = Math.max(1, Math.round(target / 28));
+        ring.style.strokeDasharray = `0 100`;
+        (function tick() {
+          cur = Math.min(target, cur + step);
+          scoreEl.textContent = cur;
+          ring.style.strokeDasharray = `${cur} 100`;
+          if (cur < target) requestAnimationFrame(tick);
+        })();
+      }
+
+      function renderSignals(signals) {
+        signalsEl.innerHTML = '';
+        (signals || []).forEach(s => {
+          const pct = Math.max(0, Math.min(100, s.value));
+          const tone = pct >= 70 ? 'good' : pct >= 50 ? 'warn' : 'bad';
+          const row = document.createElement('div');
+          row.className = 'scorer-sig';
+          row.innerHTML =
+            '<span class="scorer-sig-name">' + labelize(s.name) + '</span>' +
+            '<span class="scorer-sig-bar"><span class="scorer-sig-fill ' + tone + '" style="width:0%"></span></span>' +
+            '<span class="scorer-sig-val">' + pct + '</span>';
+          signalsEl.appendChild(row);
+          requestAnimationFrame(() => {
+            row.querySelector('.scorer-sig-fill').style.width = pct + '%';
+          });
+        });
+      }
+
+      async function score(token) {
+        btn.disabled = true;
+        btn.textContent = 'Scoring…';
+        try {
+          const res = await fetch(API + '/score?token=' + encodeURIComponent(token), { headers: { accept: 'application/json' } });
+          if (!res.ok) throw new Error('score failed');
+          const data = await res.json();
+          result.hidden = false;
+          tokenEl.textContent = data.token || token;
+          const v = VERDICTS[data.decision] || VERDICTS.SCAN;
+          badge.textContent = data.decision || 'SCAN';
+          badge.className = 'verdict-badge ' + v.cls;
+          verdictText.textContent = v.text;
+          renderSignals(data.signals);
+          animateScore(Math.max(0, Math.min(100, data.score || 0)));
+          result.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        } catch (e) {
+          result.hidden = false;
+          tokenEl.textContent = token;
+          scoreEl.textContent = '—';
+          badge.textContent = 'OFFLINE';
+          badge.className = 'verdict-badge warn';
+          verdictText.textContent = 'Agent is offline right now. Try again in a moment.';
+          signalsEl.innerHTML = '';
+        } finally {
+          btn.disabled = false;
+          btn.textContent = 'Score it';
+        }
+      }
+
+      form.addEventListener('submit', e => {
+        e.preventDefault();
+        const token = input.value.trim();
+        if (token) score(token);
+      });
+    })();
+
+    (function () {
+      const items = document.querySelectorAll('.step, .report, .why-grid, .close, .scorer-card');
       if (!('IntersectionObserver' in window)) {
         items.forEach(el => el.classList.add('in'));
         return;
