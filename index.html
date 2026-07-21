@@ -6,21 +6,50 @@
   <meta name="virtual-protocol-site-verification" content="7d1e44f42814126ddaefd581027b0a77" />
   <title>KRILL — Launch Intelligence Agent</title>
   <meta name="description" content="KRILL makes new token launches easy to understand. Scan, score 0–100, explain risk in plain English, publish transparent reports. Via Virtuals for Robinhood.">
+  <meta name="theme-color" content="#4ade80">
+  <meta name="author" content="KRILL">
+  <meta name="keywords" content="KRILL, launch intelligence, token launch, Robinhood Chain, Virtuals, on-chain intelligence, token scoring, risk analysis, crypto agent">
+  <link rel="canonical" href="https://krill.live/">
   <meta property="og:title" content="KRILL — Launch Intelligence Agent">
   <meta property="og:description" content="Scan. Score. Explain. Publish. Clarity before conviction.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://krill.live/">
   <meta property="og:image" content="https://krill.live/assets/krill-banner.png">
+  <meta property="og:image:alt" content="KRILL — Launch Intelligence Agent">
+  <meta property="og:site_name" content="KRILL">
   <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:site" content="@krillintel">
+  <meta name="twitter:creator" content="@krillintel">
   <meta name="twitter:title" content="KRILL — Launch Intelligence Agent">
   <meta name="twitter:description" content="Scan. Score. Explain. Publish. Clarity before conviction.">
   <meta name="twitter:image" content="https://krill.live/assets/krill-banner.png">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "KRILL",
+    "applicationCategory": "FinanceApplication",
+    "operatingSystem": "Web",
+    "description": "KRILL is an on-chain intelligence agent that watches new token launches, scores each one across liquidity, contract, holder, and distribution signals, and turns the raw data into a plain-English verdict.",
+    "url": "https://krill.live/",
+    "image": "https://krill.live/assets/krill-banner.png",
+    "author": { "@type": "Organization", "name": "KRILL", "url": "https://krill.live/" },
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+    "sameAs": [
+      "https://x.com/krillintel",
+      "https://app.virtuals.io/virtuals/112988",
+      "https://os.virtuals.io/community#showcase/krill"
+    ]
+  }
+  </script>
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <link rel="apple-touch-icon" href="assets/krill-icon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="css/landing.css">
+  <!-- Cloudflare Web Analytics -->
+  <script defer src='https://static.cloudflareinsights.com/beacon.min.js' data-cf-beacon='{"token": "placeholder-replace-after-cf-dashboard-setup"}'></script>
 </head>
 <body>
   <div class="fx" aria-hidden="true">
@@ -74,6 +103,20 @@
           <a class="btn" href="#how">See how it works</a>
           <a class="btn btn-ghost" id="tradeBtn" href="https://x.com/krillintel" target="_blank" rel="noreferrer">Live on Virtuals</a>
         </div>
+      </div>
+    </section>
+
+    <!-- LIVE FEED — real-time scan events -->
+    <section class="live-feed">
+      <div class="feed-header">
+        <span class="feed-status" id="feedStatus">
+          <span class="feed-pulse"></span>
+          LIVE SCAN
+        </span>
+        <span class="feed-count" id="feedCount">—</span>
+      </div>
+      <div class="feed-stream" id="feedStream">
+        <div class="feed-placeholder">Connecting to live feed...</div>
       </div>
     </section>
 
@@ -243,6 +286,11 @@
     window.KRILL_CA = '0x9D08407b8511249bec898856C506dD7c5972E7BB';
     window.KRILL_TRADE_URL = 'https://app.virtuals.io/virtuals/token/0x9D08407b8511249bec898856C506dD7c5972E7BB';
 
+    // Shared API base for all live data fetches
+    window.KRILL_API_BASE = location.hostname === 'krill.live' ? '/api' :
+                            location.hostname === 'localhost' ? 'http://localhost:8787/api' :
+                            'https://krill-api.gedangefek.workers.dev/api';
+
     (function () {
       const ca = (window.KRILL_CA || '').trim();
       const bar = document.getElementById('caBar');
@@ -272,9 +320,7 @@
         });
 
         // Fetch live price/mcap/holders from worker /token endpoint
-        const API_BASE = location.hostname === 'krill.live' ? '/api' : 
-                         location.hostname === 'localhost' ? 'http://localhost:8787/api' :
-                         'https://krill-api.gedangefek.workers.dev/api';
+        const API_BASE = window.KRILL_API_BASE;
 
         async function updateLiveData() {
           try {
@@ -297,6 +343,68 @@
         trade.href = window.KRILL_TRADE_URL;
         trade.textContent = 'Trade $KRILL';
       }
+    })();
+
+    // Live scan feed — poll /hunt endpoint and render event stream
+    (function () {
+      const stream = document.getElementById('feedStream');
+      const countEl = document.getElementById('feedCount');
+      const statusEl = document.getElementById('feedStatus');
+      if (!stream) return;
+
+      const API_BASE = window.KRILL_API_BASE;
+      const MAX_EVENTS = 30;
+      let scanCount = 0;
+      const seen = new Set();
+
+      function esc(s) {
+        const d = document.createElement('div');
+        d.textContent = String(s);
+        return d.innerHTML;
+      }
+
+      function renderEvent(ev) {
+        const key = `${ev.ts}|${ev.text}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+
+        const row = document.createElement('div');
+        row.className = 'feed-event';
+        const kind = ev.kind === 'success' ? ' success' :
+                     /warn|risk|caution/i.test(ev.text) ? ' warn' :
+                     /error|fail|reject/i.test(ev.text) ? ' error' : '';
+        row.innerHTML = `<span class="feed-event-ts">${esc(ev.ts)}</span><span class="feed-event-text${kind}">${esc(ev.text)}</span>`;
+        stream.prepend(row);
+
+        while (stream.children.length > MAX_EVENTS) {
+          stream.removeChild(stream.lastChild);
+        }
+        return true;
+      }
+
+      async function pollFeed() {
+        try {
+          const res = await fetch(`${API_BASE}/hunt`);
+          if (!res.ok) throw new Error('feed unavailable');
+          const data = await res.json();
+          const events = Array.isArray(data.events) ? data.events : [];
+
+          const placeholder = stream.querySelector('.feed-placeholder');
+          if (placeholder && events.length) placeholder.remove();
+
+          let added = 0;
+          events.forEach(ev => { if (renderEvent(ev)) added++; });
+          if (added) { scanCount += added; countEl.textContent = `${scanCount} events`; }
+          statusEl.style.opacity = '1';
+        } catch (e) {
+          statusEl.style.opacity = '0.4';
+          const placeholder = stream.querySelector('.feed-placeholder');
+          if (placeholder) placeholder.textContent = 'Feed reconnecting...';
+        }
+      }
+
+      pollFeed();
+      setInterval(pollFeed, 10000); // poll every 10s
     })();
 
     (function () {

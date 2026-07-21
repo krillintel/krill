@@ -40,6 +40,7 @@ const mem = {
     { handle: '@virtuals_feed', ago: '4h', text: 'Virtuals agents with real utility will win attention.', up: '4.5k', rt: 891, like: 312 },
   ],
   cache: { tokenData: null, tokenDataTs: 0, txs: null, txsTs: 0 },
+  analytics: { total: 0, byRoute: {}, since: Date.now() },
 };
 
 const rand = (a, b) => Math.random() * (b - a) + a;
@@ -330,6 +331,12 @@ const routes = {
   },
 
   '/solprice': async () => ({ native: { usd: await getNativePrice() }, chain: 'robinhood', ts: Date.now() }),
+
+  '/analytics': () => {
+    const uptimeMs = Date.now() - mem.analytics.since;
+    const top = Object.entries(mem.analytics.byRoute).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([route, count]) => ({ route, count }));
+    return { total: mem.analytics.total, byRoute: mem.analytics.byRoute, topRoutes: top, uptimeMs, since: mem.analytics.since, ts: Date.now() };
+  },
 };
 
 const postRoutes = {
@@ -361,6 +368,11 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { headers: cors });
     if (!path.startsWith('/api/')) return new Response('Not found', { status: 404, headers: cors });
     const route = '/' + path.slice(5);
+    // lightweight in-memory analytics (excludes the analytics route itself)
+    if (route !== '/analytics') {
+      mem.analytics.total++;
+      mem.analytics.byRoute[route] = (mem.analytics.byRoute[route] || 0) + 1;
+    }
     try {
       if (request.method === 'POST' && postRoutes[route]) return json(await postRoutes[route](request, env));
       if (request.method === 'GET' && routes[route]) return json(await routes[route](request, env));

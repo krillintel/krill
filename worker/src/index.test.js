@@ -279,6 +279,24 @@ describe('POST /api/sell', () => {
   });
 });
 
+describe('GET /api/analytics', () => {
+  it('returns request analytics', async () => {
+    const { res, data } = await call('/analytics');
+    expect(res.status).toBe(200);
+    expect(data.total).toBeTypeOf('number');
+    expect(data.byRoute).toBeTypeOf('object');
+    expect(data.topRoutes).toBeInstanceOf(Array);
+    expect(data.uptimeMs).toBeTypeOf('number');
+  });
+
+  it('increments total on tracked requests', async () => {
+    const before = (await call('/analytics')).data.total;
+    await call('/status');
+    const after = (await call('/analytics')).data.total;
+    expect(after).toBeGreaterThan(before);
+  });
+});
+
 describe('404 handling', () => {
   it('returns 404 for unknown route', async () => {
     const { res, data } = await call('/nonexistent');
