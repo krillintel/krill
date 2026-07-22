@@ -116,6 +116,8 @@
     .sec-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 16px; }
     .sec-head h2 { font-family: var(--display); font-weight: 700; color: var(--ink); font-size: 22px; }
     .sec-head .hint { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+    .live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--green); margin-right: 6px; vertical-align: middle; animation: pulse 1.6s ease-in-out infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1; box-shadow: 0 0 0 0 rgba(74,222,128,0.5); } 50% { opacity: 0.5; box-shadow: 0 0 0 4px rgba(74,222,128,0); } }
     .list { display: flex; flex-direction: column; gap: 10px; }
     .row-item { display: grid; grid-template-columns: 64px 90px 1fr; gap: 16px; align-items: center; background: var(--bg-2); border: 1px solid var(--line); border-radius: 14px; padding: 14px 18px; cursor: pointer; transition: border-color .2s, transform .12s; }
     .row-item:hover { border-color: rgba(74,222,128,0.3); transform: translateX(2px); }
@@ -300,7 +302,7 @@
     async function loadWatchlist() {
       try {
         const d = await fetch(`${API}/reports`).then(r => r.json());
-        $('#wlHint').textContent = `${d.count} scored · ${d.onChain ? 'on-chain' : 'live engine'}`;
+        $('#wlHint').innerHTML = `<span class="live-dot"></span>${d.count} scored · ${d.onChain ? 'on-chain' : 'live engine'} · auto-refresh`;
         $('#watchlist').innerHTML = d.reports.map(r => {
           const sf = safetyOf(r);
           return `
@@ -321,9 +323,26 @@
 
     $('#scanBtn').onclick = () => scan();
     $('#q').onkeydown = e => { if (e.key === 'Enter') scan(); };
-    // initial: scan KRILL + load watchlist
+
+    // ── live polling: keep watchlist + current scan fresh ──
+    const REFRESH_MS = 15000;
+    function startPolling() {
+      // pause when tab hidden to save calls; resume + refresh on return
+      setInterval(() => {
+        if (document.hidden) return;
+        loadWatchlist();
+        if (current.token) {
+          const q = current.wallet ? `?token=${current.token}&wallet=${current.wallet}` : `?token=${current.token}`;
+          fetch(`${API}/score${q}`).then(r => r.json()).then(d => { if (d && d.score != null) renderResult(d); }).catch(() => {});
+        }
+      }, REFRESH_MS);
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) loadWatchlist(); });
+    }
+
+    // initial: scan KRILL + load watchlist, then poll
     scan('KRILL');
     loadWatchlist();
+    startPolling();
   </script>
 </body>
 </html>
