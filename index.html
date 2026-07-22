@@ -67,6 +67,7 @@
       <a href="#example">Example</a>
       <a href="#try">Try it</a>
       <a href="#why">Why KRILL</a>
+      <a href="scan.html">Scan</a>
     </nav>
     <a class="nav-btn" href="https://x.com/krillintel" target="_blank" rel="noreferrer">Follow</a>
   </header>
@@ -108,7 +109,12 @@
     </section>
 
     <!-- LIVE FEED — real-time scan events -->
-    <section class="live-feed">
+    <section class="live-feed" id="live">
+      <div class="section-intro">
+        <p class="eyebrow">Live now</p>
+        <h2>KRILL is scanning as you read.</h2>
+        <p>A real-time stream of launches being scored right now — clarity, decision, and safety, straight from the engine.</p>
+      </div>
       <div class="feed-header">
         <span class="feed-status" id="feedStatus">
           <span class="feed-pulse"></span>
@@ -117,7 +123,7 @@
         <span class="feed-count" id="feedCount">—</span>
       </div>
       <div class="feed-stream" id="feedStream">
-        <div class="feed-placeholder">Connecting to live feed...</div>
+        <div class="feed-placeholder">Connecting to live feed…</div>
       </div>
     </section>
 
@@ -246,7 +252,7 @@
       <div class="section-intro">
         <p class="eyebrow">Try it live</p>
         <h2>Score any launch in seconds.</h2>
-        <p>Type a token symbol or address and let KRILL pull a live clarity score, signal breakdown, and verdict.</p>
+        <p>Paste a contract address and let KRILL pull a live clarity score, signal breakdown, and verdict.</p>
       </div>
 
       <form class="scorer-form" id="scorerForm" autocomplete="off">
@@ -254,8 +260,8 @@
           class="scorer-input"
           id="scorerInput"
           type="text"
-          placeholder="$KRILL or 0x…"
-          aria-label="Token symbol or address"
+          placeholder="Paste contract address (0x…)"
+          aria-label="Token contract address"
           maxlength="64"
           value="$KRILL"
         >
@@ -426,10 +432,13 @@
         const key = `${ev.ts}|${ev.text}`;
         if (seen.has(key)) return false;
         seen.add(key);
+        if (seen.size > 300) seen.clear(); // keep the set bounded
 
         const row = document.createElement('div');
         row.className = 'feed-event';
         const kind = ev.kind === 'success' ? ' success' :
+                     ev.kind === 'warn'    ? ' warn' :
+                     ev.kind === 'error'   ? ' error' :
                      /warn|risk|caution/i.test(ev.text) ? ' warn' :
                      /error|fail|reject/i.test(ev.text) ? ' error' : '';
         row.innerHTML = `<span class="feed-event-ts">${esc(ev.ts)}</span><span class="feed-event-text${kind}">${esc(ev.text)}</span>`;

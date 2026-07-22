@@ -118,6 +118,11 @@
     .sec-head .hint { font-family: var(--mono); font-size: 12px; color: var(--dim); }
     .live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--green); margin-right: 6px; vertical-align: middle; animation: pulse 1.6s ease-in-out infinite; }
     @keyframes pulse { 0%,100% { opacity: 1; box-shadow: 0 0 0 0 rgba(74,222,128,0.5); } 50% { opacity: 0.5; box-shadow: 0 0 0 4px rgba(74,222,128,0); } }
+    .filters { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+    .flt { font-family: var(--mono); font-size: 12.5px; color: var(--dim); background: var(--bg-2); border: 1px solid var(--line); border-radius: 10px; padding: 7px 14px; cursor: pointer; transition: color .2s, border-color .2s, background .2s; }
+    .flt:hover { color: var(--ink); border-color: rgba(74,222,128,0.3); }
+    .flt.active { color: #04220f; background: var(--green); border-color: var(--green); font-weight: 600; }
+    .flt-empty { padding: 24px; text-align: center; color: var(--dim); font-family: var(--mono); font-size: 13px; }
     .list { display: flex; flex-direction: column; gap: 10px; }
     .row-item { display: grid; grid-template-columns: 64px 90px 1fr; gap: 16px; align-items: center; background: var(--bg-2); border: 1px solid var(--line); border-radius: 14px; padding: 14px 18px; cursor: pointer; transition: border-color .2s, transform .12s; }
     .row-item:hover { border-color: rgba(74,222,128,0.3); transform: translateX(2px); }
@@ -159,9 +164,9 @@
     <header class="hero">
       <div class="eyebrow">Live Scan Terminal</div>
       <h1>Score any launch. Read the verdict.</h1>
-      <p>Type a ticker. KRILL scores it 0–100 and explains the risk. Hold $KRILL to unlock the full signal breakdown.</p>
+      <p>Paste a contract address. KRILL scores it 0–100 and explains the risk. Hold $KRILL to unlock the full signal breakdown.</p>
       <div class="search">
-        <input id="q" type="text" placeholder="$TICKER — e.g. KRILL, NOVA" autocomplete="off" spellcheck="false">
+        <input id="q" type="text" placeholder="Paste contract address (0x…)" autocomplete="off" spellcheck="false">
         <button class="btn" id="scanBtn">Scan</button>
       </div>
     </header>
@@ -176,6 +181,12 @@
       <div class="sec-head">
         <h2>Public watchlist</h2>
         <span class="hint" id="wlHint">loading…</span>
+      </div>
+      <div class="filters" id="filters" role="tablist" aria-label="Filter by safety">
+        <button class="flt active" data-filter="ALL" role="tab" aria-selected="true">All</button>
+        <button class="flt" data-filter="SAFE" role="tab" aria-selected="false">✓ Safe</button>
+        <button class="flt" data-filter="CAUTION" role="tab" aria-selected="false">⚠ Caution</button>
+        <button class="flt" data-filter="NOT SAFE" role="tab" aria-selected="false">✗ Not safe</button>
       </div>
       <div class="list" id="watchlist">
         <div class="center" style="padding:30px;"><span class="spin"></span></div>
@@ -299,22 +310,37 @@
       } finally { $('#scanBtn').disabled = false; }
     }
 
+    // watchlist state — cached so filters re-render without re-fetching
+    let allReports = [];
+    let activeFilter = 'ALL';
+
+    function renderWatchlist() {
+      const rows = activeFilter === 'ALL' ? allReports : allReports.filter(r => safetyOf(r) === activeFilter);
+      if (!rows.length) {
+        $('#watchlist').innerHTML = `<div class="flt-empty">no tokens in “${activeFilter.toLowerCase()}” right now</div>`;
+        return;
+      }
+      $('#watchlist').innerHTML = rows.map(r => {
+        const sf = safetyOf(r);
+        return `
+        <div class="row-item" data-token="${r.token}">
+          <div class="sc ${labelClass(r.label)}">${r.score}</div>
+          <div class="tk">${r.token}<br><span class="safe-badge ${safetyClass(sf)}">${safetyIcon(sf)}</span></div>
+          <div class="vd">${r.verdict}</div>
+        </div>`;
+      }).join('');
+      document.querySelectorAll('.row-item').forEach(el => {
+        el.onclick = () => { const t = el.getAttribute('data-token'); $('#q').value = t; scan(t); window.scrollTo({ top: 0, behavior: 'smooth' }); };
+      });
+    }
+
     async function loadWatchlist() {
       try {
         const d = await fetch(`${API}/reports`).then(r => r.json());
-        $('#wlHint').innerHTML = `<span class="live-dot"></span>${d.count} scored · ${d.onChain ? 'on-chain' : 'live engine'} · auto-refresh`;
-        $('#watchlist').innerHTML = d.reports.map(r => {
-          const sf = safetyOf(r);
-          return `
-          <div class="row-item" data-token="${r.token}">
-            <div class="sc ${labelClass(r.label)}">${r.score}</div>
-            <div class="tk">${r.token}<br><span class="safe-badge ${safetyClass(sf)}">${safetyIcon(sf)}</span></div>
-            <div class="vd">${r.verdict}</div>
-          </div>`;
-        }).join('');
-        document.querySelectorAll('.row-item').forEach(el => {
-          el.onclick = () => { const t = el.getAttribute('data-token'); $('#q').value = t; scan(t); window.scrollTo({ top: 0, behavior: 'smooth' }); };
-        });
+        allReports = d.reports || [];
+        const shown = activeFilter === 'ALL' ? d.count : allReports.filter(r => safetyOf(r) === activeFilter).length;
+        $('#wlHint').innerHTML = `<span class="live-dot"></span>${shown}/${d.count} · ${d.onChain ? 'on-chain' : 'live engine'} · auto-refresh`;
+        renderWatchlist();
       } catch (e) {
         $('#watchlist').innerHTML = '<div class="center muted" style="padding:24px;">watchlist unavailable — API unreachable.</div>';
         $('#wlHint').textContent = 'offline';
@@ -323,6 +349,22 @@
 
     $('#scanBtn').onclick = () => scan();
     $('#q').onkeydown = e => { if (e.key === 'Enter') scan(); };
+
+    // ── safety filter tabs ──
+    document.querySelectorAll('.flt').forEach(btn => {
+      btn.onclick = () => {
+        activeFilter = btn.getAttribute('data-filter');
+        document.querySelectorAll('.flt').forEach(b => {
+          const on = b === btn;
+          b.classList.toggle('active', on);
+          b.setAttribute('aria-selected', on ? 'true' : 'false');
+        });
+        const total = allReports.length;
+        const shown = activeFilter === 'ALL' ? total : allReports.filter(r => safetyOf(r) === activeFilter).length;
+        $('#wlHint').innerHTML = `<span class="live-dot"></span>${shown}/${total} · auto-refresh`;
+        renderWatchlist();
+      };
+    });
 
     // ── live polling: keep watchlist + current scan fresh ──
     const REFRESH_MS = 15000;

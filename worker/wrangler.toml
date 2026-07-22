@@ -3,6 +3,15 @@ main = "src/index.js"
 compatibility_date = "2024-09-01"
 account_id = "1a42d1659106367dbb2707a2fb95d9f7"
 
+# KV store for the incremental holder indexer (balance map + checkpoint)
+[[kv_namespaces]]
+binding = "KRILL_INDEX"
+id = "7538a7e28f5e459a928c426aeb531a95"
+
+# Cron: advance the holder indexer every minute
+[triggers]
+crons = ["* * * * *"]
+
 # Robinhood Chain (EVM, chainId 4663)
 # Set RPC_URL secret: npx wrangler secret put RPC_URL
 # Value: https://rpc.robinhood.com (or your Robinhood chain RPC)

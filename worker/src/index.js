@@ -199,9 +199,14 @@ async function getTokenOnChain(env) {
     // ERC-20 decimals() = 0x313ce567
     const decimalsHex = await rpcCall('eth_call', [{ to: CA, data: '0x313ce567' }, 'latest'], env);
     const decimals = parseInt(decimalsHex, 16);
+    // holder count + concentration come from the incremental KV indexer (cron-fed)
+    const idx = await getIndexedHolders(env).catch(() => null);
     const result = {
       totalSupply, decimals, circulatingSupply: totalSupply,
-      holderCount: 0, topHolderPct: 0, topHolders: [],
+      holderCount: idx ? idx.holderCount : 0,
+      topHolderPct: idx ? idx.topHolderPct : 0,
+      topHolders: [],
+      indexed: idx ? { done: idx.done, syncedTo: idx.syncedTo, tipBlock: idx.tipBlock } : null,
     };
     mem.cache.tokenData = result;
     mem.cache.tokenDataTs = now;
@@ -209,6 +214,89 @@ async function getTokenOnChain(env) {
   } catch {
     return mem.cache.tokenData || { totalSupply: TOTAL_SUPPLY, decimals: 18, circulatingSupply: 19_241_103, holderCount: 5, topHolderPct: 97.65, topHolders: [] };
   }
+}
+
+// ══════════ HOLDER INDEXER ══════════
+// Robinhood RPC caps eth_getLogs at a 10k-block range and the token has ~4.15M
+// blocks of history, so we can't scan it all in one request. Instead we walk the
+// Transfer log forward in small chunks on a cron trigger, keeping a running
+// balance map + checkpoint in KV. Endpoints read the derived holder stats from KV.
+const DEPLOY_BLOCK = 12122815;              // first block $KRILL had code
+const LOG_CHUNK = 9000;                     // < 10k RPC cap (inclusive range)
+const CHUNKS_PER_TICK = 20;                 // chunks advanced per cron minute
+const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const IDX_STATE_KEY = 'idx:state';          // { fromBlock, balances:{addr:decStr}, holders, topHolderPct, done, updatedAt }
+const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
+
+const topicToAddr = (t) => '0x' + t.slice(26).toLowerCase(); // 32-byte topic → 20-byte address
+
+// Derive holderCount + topHolderPct from a { addr: bigintString } balance map.
+function deriveHolderStats(balances) {
+  let holders = 0, total = 0n, top = 0n;
+  for (const v of Object.values(balances)) {
+    const bal = BigInt(v);
+    if (bal <= 0n) continue;
+    holders++;
+    total += bal;
+    if (bal > top) top = bal;
+  }
+  const topHolderPct = total > 0n ? Number((top * 10000n) / total) / 100 : 0;
+  return { holderCount: holders, topHolderPct: parseFloat(topHolderPct.toFixed(2)) };
+}
+
+// Advance the indexer by up to CHUNKS_PER_TICK log windows. Safe to call from cron.
+async function advanceIndexer(env) {
+  if (!env?.KRILL_INDEX || !env?.RPC_URL) return { skipped: 'no KV or RPC' };
+  const raw = await env.KRILL_INDEX.get(IDX_STATE_KEY);
+  const state = raw ? JSON.parse(raw) : { fromBlock: DEPLOY_BLOCK, balances: {}, holders: 0, topHolderPct: 0, done: false };
+  const balances = state.balances || {};
+
+  const latest = parseInt(await rpcCall('eth_blockNumber', [], env), 16);
+  let from = state.fromBlock;
+  let processed = 0;
+
+  for (let i = 0; i < CHUNKS_PER_TICK && from <= latest; i++) {
+    const to = Math.min(from + LOG_CHUNK - 1, latest);
+    let logs;
+    try {
+      logs = await rpcCall('eth_getLogs', [{
+        address: CA, topics: [TRANSFER_TOPIC],
+        fromBlock: '0x' + from.toString(16), toBlock: '0x' + to.toString(16),
+      }], env);
+    } catch { break; } // RPC hiccup — resume next tick from same checkpoint
+
+    for (const lg of logs) {
+      // topics: [sig, from, to]; data: amount (uint256)
+      if (!lg.topics || lg.topics.length < 3) continue;
+      const fromA = topicToAddr(lg.topics[1]);
+      const toA = topicToAddr(lg.topics[2]);
+      const amt = BigInt(lg.data || '0x0');
+      if (fromA !== ZERO_ADDR) balances[fromA] = ((BigInt(balances[fromA] || '0')) - amt).toString();
+      if (toA !== ZERO_ADDR) balances[toA] = ((BigInt(balances[toA] || '0')) + amt).toString();
+    }
+    processed += logs.length;
+    from = to + 1;
+  }
+
+  const stats = deriveHolderStats(balances);
+  const done = from > latest;
+  const next = {
+    fromBlock: from, balances,
+    holderCount: stats.holderCount, topHolderPct: stats.topHolderPct,
+    tipBlock: latest, done, updatedAt: Date.now(),
+  };
+  await env.KRILL_INDEX.put(IDX_STATE_KEY, JSON.stringify(next));
+  return { processed, fromBlock: from, latest, holders: stats.holderCount, topHolderPct: stats.topHolderPct, done };
+}
+
+// Read cached holder stats from KV (null if indexer hasn't produced any yet).
+async function getIndexedHolders(env) {
+  if (!env?.KRILL_INDEX) return null;
+  const raw = await env.KRILL_INDEX.get(IDX_STATE_KEY);
+  if (!raw) return null;
+  const s = JSON.parse(raw);
+  if (!s.holderCount && s.holderCount !== 0) return null;
+  return { holderCount: s.holderCount, topHolderPct: s.topHolderPct, done: !!s.done, syncedTo: s.fromBlock, tipBlock: s.tipBlock, updatedAt: s.updatedAt };
 }
 
 // ── Recent transactions (30s cache, placeholder until indexer available) ──
@@ -227,6 +315,44 @@ async function getRecentTxs(env) {
     mem.cache.txsTs = now;
     return txs;
   } catch { return mem.cache.txs || []; }
+}
+
+// ── Live scan feed generator ──
+// Produces a fresh burst of scan events each poll so the landing-page live
+// feed keeps moving. Scores come from the same deterministic engine so a
+// given token always reads the same, but timestamps + ordering are live.
+const HUNT_POOL = ['$KRILL', '$NOVA', '$MOON', '$PULSE', '$VOID', '$FROG', '$NEON', '$PUMP', '$DEEP', '$LOW'];
+
+function buildHuntEvents() {
+  mem.scanTotal += irand(0, 2);
+  const now = new Date();
+  // pick 1-2 tokens to "scan" this tick
+  const picks = [];
+  const n = 1 + irand(0, 2);
+  for (let i = 0; i < n; i++) picks.push(HUNT_POOL[irand(0, HUNT_POOL.length)]);
+
+  const events = [];
+  let offset = 0;
+  const stamp = () => {
+    const t = new Date(now.getTime() - offset * 1000);
+    offset += irand(0, 2);
+    return t.toLocaleTimeString('en-GB');
+  };
+
+  for (const token of picks) {
+    const { score, decision, safety, signals } = computeScore(token, { holderCount: 0, topHolderPct: 0 });
+    const top = [...signals].sort((a, b) => b.value - a.value)[0];
+    events.push({ ts: stamp(), text: `scanning ${token} — reading launch metadata` });
+    events.push({ ts: stamp(), text: `${token} signals: ${top.name.replace('_', ' ')}=${top.value} clarity=${score}` });
+    if (decision === 'SIGNAL') {
+      events.push({ ts: stamp(), text: `✓ ${token} READABLE ${score}/100 — ${safety}`, kind: 'success' });
+    } else if (decision === 'SCAN') {
+      events.push({ ts: stamp(), text: `${token} MIXED ${score}/100 — ${safety}`, kind: 'warn' });
+    } else {
+      events.push({ ts: stamp(), text: `${token} NOISY ${score}/100 — ${safety}`, kind: 'error' });
+    }
+  }
+  return events;
 }
 
 // ══════════ ROUTES ══════════
@@ -261,17 +387,7 @@ const routes = {
     volume24h: 185.7, newPools: 7,
   }),
 
-  '/hunt': () => ({
-    events: [
-      { ts: '14:32:07', text: 'Robinhood launch feed updated' },
-      { ts: '14:32:08', text: 'scoring: narrative=92 clarity=88 risk=61' },
-      { ts: '14:32:08', text: 'composite launch clarity: 86/100' },
-      { ts: '14:32:09', text: 'decision: PUBLISH explainer' },
-      { ts: '14:32:09', text: 'note: retail-friendly utility detected' },
-      { ts: '14:32:11', text: 'report: launch-brief-krill-001' },
-      { ts: '14:32:11', text: '✓ READY — readable launch brief generated', kind: 'success' },
-    ],
-  }),
+  '/hunt': () => ({ events: buildHuntEvents() }),
 
   '/profit': () => ({
     periods: [
@@ -481,10 +597,27 @@ const routes = {
     const top = Object.entries(mem.analytics.byRoute).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([route, count]) => ({ route, count }));
     return { total: mem.analytics.total, byRoute: mem.analytics.byRoute, topRoutes: top, uptimeMs, since: mem.analytics.since, ts: Date.now() };
   },
+
+  // Holder indexer progress — transparent view of the cron-fed KV index.
+  '/index-status': async (req, env) => {
+    const idx = await getIndexedHolders(env).catch(() => null);
+    if (!idx) return { indexing: false, reason: env?.KRILL_INDEX ? 'not started' : 'KV not bound', ts: Date.now() };
+    const span = idx.tipBlock - DEPLOY_BLOCK;
+    const scanned = Math.max(0, idx.syncedTo - DEPLOY_BLOCK);
+    return {
+      indexing: !idx.done, done: idx.done,
+      holderCount: idx.holderCount, topHolderPct: idx.topHolderPct,
+      syncedToBlock: idx.syncedTo, tipBlock: idx.tipBlock,
+      progressPct: span > 0 ? parseFloat(Math.min(100, (scanned / span) * 100).toFixed(2)) : 100,
+      updatedAt: idx.updatedAt, ts: Date.now(),
+    };
+  },
 };
 
 const postRoutes = {
   '/mode': async (req) => { const b = await req.json(); mem.mode = b.mode === 'PAUSE' ? 'PAUSE' : 'SIGNAL'; return { mode: mem.mode }; },
+  // manual kick for the holder indexer (same work the cron does each minute)
+  '/reindex': async (req, env) => ({ ok: true, ...(await advanceIndexer(env)) }),
   '/bid': async (req) => {
     const b = await req.json();
     const tx = txHash();
@@ -506,6 +639,11 @@ const postRoutes = {
 };
 
 export default {
+  // cron trigger — advance the holder indexer each minute
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(advanceIndexer(env).catch(() => {}));
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;

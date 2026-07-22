@@ -83,6 +83,17 @@ describe('GET /api/hunt', () => {
     expect(data.events[0]).toHaveProperty('ts');
     expect(data.events[0]).toHaveProperty('text');
   });
+
+  it('every event has a ts and non-empty text', async () => {
+    const { data } = await call('/hunt');
+    for (const ev of data.events) {
+      expect(typeof ev.ts).toBe('string');
+      expect(ev.ts.length).toBeGreaterThan(0);
+      expect(typeof ev.text).toBe('string');
+      expect(ev.text.length).toBeGreaterThan(0);
+      if (ev.kind) expect(['success', 'warn', 'error']).toContain(ev.kind);
+    }
+  });
 });
 
 describe('GET /api/profit', () => {
