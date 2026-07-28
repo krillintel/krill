@@ -1,0 +1,9 @@
+# krill.live root serves the scan terminal (rewrite, URL stays "/")
+# Target must be the clean-URL path (/scan), not /scan.html — Pages 308-redirects
+# .html paths to their clean form, which broke the silent rewrite.
+/            /scan        200
+
+# Landing page is served natively at /about (Cloudflare Pages clean URL for about.html).
+# Do NOT rewrite /about → /about.html (that causes a clean-URL redirect loop).
+# Old /home path just redirects to /about.
+/home        /about       301

@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KRILL — Docs</title>
+  <meta name="description" content="How KRILL scores launches: the 5 signals, the 0–100 clarity score, safety verdicts, and the AI agent — all free, no wallet needed.">
+  <meta name="theme-color" content="#4ade80">
+  <link rel="canonical" href="https://krill.live/docs">
+  <meta property="og:title" content="KRILL — Docs">
+  <meta property="og:description" content="How KRILL scores launches: 5 signals, 0–100 clarity, safety verdicts, and $KRILL tiers.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://krill.live/docs">
+  <meta property="og:image" content="https://krill.live/assets/krill-scan-card.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:site" content="@krillintel">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #040604; --bg-2: #0a0f0a; --ink: #eef5ef; --mute: #8a948a; --dim: #5a645a;
+      --line: #1a211a; --green: #4ade80; --green-deep: #16a34a; --warn: #fbbf24; --red: #f87171;
+      --display: "Syne", system-ui, sans-serif; --body: "IBM Plex Sans", system-ui, sans-serif;
+      --mono: "IBM Plex Mono", ui-monospace, monospace;
+      --pad: clamp(18px, 5vw, 48px); --max: 860px;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body { font-family: var(--body); background: var(--bg); color: var(--mute); line-height: 1.7; -webkit-font-smoothing: antialiased; overflow-x: hidden; min-height: 100vh; }
+    a { color: var(--green); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .fx { position: fixed; inset: 0; z-index: -1; pointer-events: none;
+      background: radial-gradient(ellipse 90% 55% at 50% -10%, rgba(34,197,94,0.13), transparent 55%); }
+    .fx-grid { position: absolute; inset: 0;
+      background-image: linear-gradient(rgba(74,222,128,0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(74,222,128,0.03) 1px, transparent 1px);
+      background-size: 56px 56px; mask-image: radial-gradient(ellipse 70% 50% at 50% 10%, black, transparent); }
+    .wrap { max-width: var(--max); margin: 0 auto; padding: 0 var(--pad); }
+
+    /* nav */
+    .nav { display: flex; align-items: center; justify-content: space-between; height: 64px; border-bottom: 1px solid var(--line); }
+    .nav .brand { display: flex; align-items: center; gap: 10px; font-family: var(--display); font-weight: 800; color: var(--ink); font-size: 20px; letter-spacing: -0.5px; }
+    .nav .brand img { width: 28px; height: 28px; }
+    .nav .links { display: flex; align-items: center; gap: 22px; font-size: 14px; }
+    .nav .links a { color: var(--mute); }
+    .nav .links a:hover { color: var(--green); text-decoration: none; }
+    .nav .links a.cta { color: #04220f; background: var(--green); border-radius: 999px; padding: 7px 16px; font-weight: 600; }
+
+    /* header */
+    header.top { padding: clamp(40px, 8vw, 80px) 0 20px; }
+    .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: 5px; color: var(--green); text-transform: uppercase; }
+    header.top h1 { font-family: var(--display); font-weight: 800; color: var(--ink); font-size: clamp(32px, 6vw, 52px); letter-spacing: -1.5px; margin: 12px 0 10px; line-height: 1.05; }
+    header.top p { font-size: clamp(15px, 2vw, 18px); max-width: 620px; }
+
+    /* toc */
+    .toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 26px 0 8px; }
+    .toc a { font-family: var(--mono); font-size: 12.5px; color: var(--mute); background: var(--bg-2); border: 1px solid var(--line); border-radius: 999px; padding: 6px 14px; }
+    .toc a:hover { color: var(--green); border-color: rgba(74,222,128,0.4); text-decoration: none; }
+
+    /* sections */
+    section.doc { padding: 34px 0; border-top: 1px solid var(--line); }
+    section.doc:first-of-type { border-top: none; }
+    h2 { font-family: var(--display); font-weight: 700; color: var(--ink); font-size: clamp(22px, 3.5vw, 30px); letter-spacing: -0.5px; margin-bottom: 8px; scroll-margin-top: 20px; }
+    h3 { font-family: var(--display); font-weight: 700; color: var(--ink); font-size: 18px; margin: 22px 0 6px; }
+    p { margin-bottom: 12px; }
+    p .ink { color: var(--ink); }
+    ul { margin: 8px 0 12px 0; padding-left: 4px; list-style: none; }
+    li { padding: 6px 0 6px 22px; position: relative; }
+    li::before { content: '→'; position: absolute; left: 0; color: var(--green); }
+
+    /* score legend */
+    .legend { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 16px 0; }
+    .leg { background: var(--bg-2); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; }
+    .leg .band { font-family: var(--mono); font-size: 12px; letter-spacing: 1px; color: var(--dim); }
+    .leg .name { font-family: var(--display); font-weight: 800; font-size: 20px; margin: 4px 0 6px; }
+    .leg.safe { border-color: rgba(74,222,128,0.42); } .leg.safe .name { color: var(--green); }
+    .leg.caution { border-color: rgba(251,191,36,0.38); } .leg.caution .name { color: var(--warn); }
+    .leg.notsafe { border-color: rgba(248,113,113,0.38); } .leg.notsafe .name { color: var(--red); }
+    .leg p { font-size: 13.5px; margin: 0; }
+
+    /* signal table */
+    .tbl { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
+    .tbl th, .tbl td { text-align: left; padding: 11px 12px; border-bottom: 1px solid var(--line); }
+    .tbl th { font-family: var(--mono); font-size: 11px; letter-spacing: 1px; color: var(--dim); text-transform: uppercase; }
+    .tbl td { color: var(--ink); }
+    .tbl td .w { font-family: var(--mono); color: var(--green); }
+    .tbl td.desc { color: var(--mute); }
+
+    /* tiers */
+    .tiers { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 16px 0; }
+    .tier { background: var(--bg-2); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+    .tier .t { font-family: var(--display); font-weight: 800; color: var(--ink); font-size: 18px; }
+    .tier .min { font-family: var(--mono); font-size: 12px; color: var(--green); margin: 4px 0 10px; }
+    .tier ul { margin: 0; } .tier li { font-size: 13px; padding: 3px 0 3px 20px; color: var(--mute); }
+    .tier.hi { border-color: rgba(74,222,128,0.35); }
+
+    .note { background: rgba(74,222,128,0.05); border: 1px dashed rgba(74,222,128,0.3); border-radius: 12px; padding: 14px 18px; font-size: 14px; margin: 14px 0; }
+    .note b { color: var(--green); }
+
+    code { font-family: var(--mono); font-size: 13px; background: var(--bg-2); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; color: var(--ink); }
+
+    footer { border-top: 1px solid var(--line); margin-top: 40px; padding: 26px 0 40px; text-align: center; }
+    footer .mono { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+    footer a { color: var(--dim); } footer a:hover { color: var(--green); }
+    .disc { max-width: 620px; margin: 10px auto 0; font-size: 12px; color: var(--dim); line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <div class="fx" aria-hidden="true"><div class="fx-grid"></div></div>
+
+  <div class="wrap">
+    <nav class="nav">
+      <a class="brand" href="/"><img src="assets/krill-token.png" alt="KRILL">KRILL</a>
+      <div class="links">
+        <a href="/about">About</a>
+        <a href="https://app.virtuals.io/virtuals/112988" target="_blank" rel="noopener">Virtuals</a>
+        <a href="https://x.com/krillintel" target="_blank" rel="noopener">X</a>
+        <a class="cta" href="/">Open scanner</a>
+      </div>
+    </nav>
+
+    <header class="top">
+      <div class="eyebrow">Documentation</div>
+      <h1>How KRILL reads a launch.</h1>
+      <p>KRILL turns a messy new token launch into one clear number and a plain-English verdict. No hype, no charts to decode — just a readable signal. Here's exactly how it works.</p>
+      <div class="toc">
+        <a href="#score">The score</a>
+        <a href="#signals">The 5 signals</a>
+        <a href="#safety">Safety verdicts</a>
+        <a href="#tiers">Access tiers</a>
+        <a href="#scan">How to scan</a>
+        <a href="#faq">FAQ</a>
+      </div>
+    </header>
+
+    <section class="doc" id="score">
+      <h2>The clarity score</h2>
+      <p>Every launch gets a single <span class="ink">clarity score from 0 to 100</span>. Higher means the launch is easier to read: healthy liquidity, sane holder distribution, and coherent signals. Lower means it's noisy, uneven, or hard to verify.</p>
+      <p>The score is a weighted blend of five signals (below). It's <span class="ink">deterministic</span> — the same token always reads the same way, so you can compare launches fairly instead of chasing a number that jumps around.</p>
+      <div class="legend">
+        <div class="leg safe">
+          <div class="band">70 – 100</div>
+          <div class="name">✓ SAFE</div>
+          <p>Readable launch. Clean signals, low friction. Labeled <code>READABLE</code> · decision <code>SIGNAL</code>.</p>
+        </div>
+        <div class="leg caution">
+          <div class="band">50 – 69</div>
+          <div class="name">⚠ CAUTION</div>
+          <p>Readable but uneven. One or more signals are weak. Labeled <code>MIXED</code> · decision <code>SCAN</code>.</p>
+        </div>
+        <div class="leg notsafe">
+          <div class="band">0 – 49</div>
+          <div class="name">✗ NOT SAFE</div>
+          <p>Hard to read or high risk. Labeled <code>NOISY</code> · decision <code>SKIP</code>.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="doc" id="signals">
+      <h2>The 5 signals</h2>
+      <p>The score is built from five weighted signals. Liquidity and holder shape carry the most weight because they're the hardest to fake.</p>
+      <table class="tbl">
+        <thead><tr><th>Signal</th><th>Weight</th><th>What it reads</th></tr></thead>
+        <tbody>
+          <tr><td>liquidity path</td><td><span class="w">25%</span></td><td class="desc">Depth and health of the launch's liquidity — can you actually get in and out.</td></tr>
+          <tr><td>holder shape</td><td><span class="w">25%</span></td><td class="desc">Holder count and top-holder concentration. Fewer whales holding a huge % = riskier.</td></tr>
+          <tr><td>social velocity</td><td><span class="w">20%</span></td><td class="desc">Momentum and attention around the launch, relative to its size.</td></tr>
+          <tr><td>contract claims</td><td><span class="w">20%</span></td><td class="desc">How well the contract's promises match its on-chain behavior.</td></tr>
+          <tr><td>narrative fit</td><td><span class="w">10%</span></td><td class="desc">Whether the story is coherent and consistent, not a copy-paste of the last trend.</td></tr>
+        </tbody>
+      </table>
+      <div class="note">Everything core is <b>free for everyone</b> — the headline score, the full 5-signal breakdown, and the AI-written verdict. No wallet, no signature, no $KRILL required.</div>
+    </section>
+
+    <section class="doc" id="safety">
+      <h2>Safety verdicts</h2>
+      <p>Every scan and every row in the public watchlist carries a safety badge, so you get the call at a glance without reading the number:</p>
+      <ul>
+        <li><span class="ink">✓ SAFE</span> — score 70+. The launch reads clean. Still your call, but nothing obvious is off.</li>
+        <li><span class="ink">⚠ CAUTION</span> — score 50–69. Readable but uneven; the verdict names the specific weak signal to watch.</li>
+        <li><span class="ink">✗ NOT SAFE</span> — score under 50. Noisy or hard to verify. Handle with care.</li>
+      </ul>
+      <p>The verdict line is written from the strongest and weakest signals, e.g. <em>"Strong liquidity path; watch social velocity. Clean read."</em></p>
+    </section>
+
+    <section class="doc" id="tiers">
+      <h2>Access tiers</h2>
+      <p>The full launch intelligence — score, breakdown, verdict, and the AI agent — is <span class="ink">free for everyone</span>. Holding $KRILL only adds power-user extras. Tier checks are <span class="ink">read-only</span>: you paste an address, KRILL reads its balance on-chain. No wallet connection, no signature, nothing to approve.</p>
+      <div class="tiers">
+        <div class="tier hi">
+          <div class="t">PUBLIC</div>
+          <div class="min">Free · 0 $KRILL</div>
+          <ul><li>Headline score</li><li>Full 5-signal breakdown</li><li>AI-written verdict</li><li>Ask KRILL agent</li><li>Public watchlist</li></ul>
+        </div>
+        <div class="tier">
+          <div class="t">PRO</div>
+          <div class="min">100,000 $KRILL</div>
+          <ul><li>Everything free, plus:</li><li>Priority scans</li><li>Custom watchlists</li></ul>
+        </div>
+        <div class="tier">
+          <div class="t">WHALE</div>
+          <div class="min">1,000,000 $KRILL</div>
+          <ul><li>Everything in Pro</li><li>Launch alerts</li></ul>
+        </div>
+      </div>
+      <div class="note">Even <b>$KRILL is scored honestly</b> by the same engine — no special treatment on the safety call.</div>
+    </section>
+
+    <section class="doc" id="scan">
+      <h2>How to scan</h2>
+      <ul>
+        <li>Open the <a href="/">scanner</a> and paste a contract address (<code>0x…</code>), or tap an example chip to try one instantly.</li>
+        <li>Read the clarity score, the safety badge, the full 5-signal breakdown, and the AI verdict — all free, no wallet needed.</li>
+        <li>Ask the <span class="ink">KRILL agent</span> anything about the launch — it reasons over the live signals in plain English.</li>
+        <li>Browse the <span class="ink">public watchlist</span> and filter by Safe / Caution / Not safe. It auto-refreshes live.</li>
+      </ul>
+    </section>
+
+    <section class="doc" id="faq">
+      <h2>FAQ</h2>
+      <h3>Is this financial advice?</h3>
+      <p>No. Scores are informational signals about how <em>readable</em> a launch is — not a recommendation to buy or sell. Always do your own research.</p>
+      <h3>Do I have to hold $KRILL to use it?</h3>
+      <p>No. The score, the full 5-signal breakdown, the AI verdict, and the Ask KRILL agent are all free for everyone — no token, no wallet, no signature. Holding $KRILL only adds power-user extras like priority scans, custom watchlists, and launch alerts.</p>
+      <h3>Do I need to connect a wallet?</h3>
+      <p>Never. Tier checks are read-only balance lookups from a pasted address. KRILL never asks for a signature or transaction.</p>
+      <h3>Why does the same token always get the same score?</h3>
+      <p>The engine is deterministic by design. A score that flickers every refresh is noise; a stable score lets you compare launches fairly over time.</p>
+      <h3>What chain is this?</h3>
+      <p>KRILL runs via <a href="https://app.virtuals.io/virtuals/112988" target="_blank" rel="noopener">Virtuals</a> on Robinhood Chain. On-chain reads (holders, supply, top-holder %) come straight from the chain.</p>
+      <h3>Where's the token?</h3>
+      <p>$KRILL is live on Virtuals. Follow <a href="https://x.com/krillintel" target="_blank" rel="noopener">@krillintel</a> for launch updates.</p>
+    </section>
+  </div>
+
+  <footer>
+    <div class="wrap">
+      <div class="mono">$KRILL · <a href="https://krill.live">krill.live</a> · Live on Virtuals · Robinhood Chain</div>
+      <p class="disc">Scores are informational, not financial advice. Address-based tier checks are read-only — no wallet connection or signature required.</p>
+    </div>
+  </footer>
+</body>
+</html>

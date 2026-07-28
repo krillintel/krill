@@ -3,10 +3,28 @@ main = "src/index.js"
 compatibility_date = "2024-09-01"
 account_id = "1a42d1659106367dbb2707a2fb95d9f7"
 
+# Workers AI — powers KRILL's reasoning (LLM verdicts + conversational agent)
+[ai]
+binding = "AI"
+
 # KV store for the incremental holder indexer (balance map + checkpoint)
 [[kv_namespaces]]
 binding = "KRILL_INDEX"
 id = "7538a7e28f5e459a928c426aeb531a95"
+
+# Durable Object rate limiter — one instance per caller key (ip:<ip> or
+# k:<apikey>). Strongly consistent hard-cap enforcement: unlike the native
+# Rate Limiting binding (permissive + eventually consistent), a DO trips 429
+# precisely at the limit because every request for a key routes to the same
+# single-threaded actor. Anonymous IPs get 60/min; X-API-Key callers get 600.
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiterDO"
+
+# SQLite-backed DO migration (works on both Free and Paid plans).
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimiterDO"]
 
 # Cron: advance the holder indexer every minute
 [triggers]

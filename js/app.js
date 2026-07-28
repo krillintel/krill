@@ -187,6 +187,7 @@
       `  <span class="d">│</span>  <span class="w bold">token</span>       <span class="dim">$KRILL token stats</span>               <span class="d">│</span>`,
       `  <span class="d">│</span>  <span class="w bold">leaderboard</span> <span class="dim">top signal agents</span>               <span class="d">│</span>`,
       `  <span class="d">│</span>  <span class="w bold">score</span>       <span class="dim">score any token</span>                  <span class="d">│</span>`,
+      `  <span class="d">│</span>  <span class="w bold">share</span>       <span class="dim">shareable clarity card + tweet</span>    <span class="d">│</span>`,
       `  <span class="d">│</span>  <span class="w bold">about</span>       <span class="dim">about krill</span>                      <span class="d">│</span>`,
       `  <span class="d">│</span>  <span class="w bold">clear</span>       <span class="dim">clear terminal</span>                   <span class="d">│</span>`,
       `  <span class="d">│</span>                                                <span class="d">│</span>`,
@@ -689,9 +690,56 @@
       return lines;
     },
 
+    share: async (args) => {
+      const token = (args || '').split(/\s+/).filter(Boolean)[0];
+      if (!token) {
+        return [
+          `  <span class="r">usage:</span> <span class="w">share &lt;token&gt;</span>`,
+          `  <span class="dim">example:</span> <span class="c">share $KRILL</span>`,
+          `  <span class="dim">generates a shareable clarity card + tweet link</span>`,
+        ];
+      }
+      const d = await KrillAPI.fetchAPI('/score?token=' + encodeURIComponent(token));
+      const clean = String(token).replace(/^\$+/, '').toUpperCase();
+      const base = KrillAPI.API_BASE.replace(/\/api$/, '');
+      const cardUrl = `${base}/api/card?token=${encodeURIComponent(clean)}`;
+      const embedUrl = `${base}/api/embed?token=${encodeURIComponent(clean)}`;
+      const tweetText = `$${clean} — clarity ${d.score}/100 · ${d.safety}\n\n${d.verdict}\n\nscanned free on 🦐 krill.live`;
+      const tweetUrl = `https://twitter.com/intent/tweet?text=${encodeURIComponent(tweetText)}&url=${encodeURIComponent(embedUrl)}`;
+
+      // copy the unfurl link to clipboard (best-effort)
+      let copied = false;
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(embedUrl);
+          copied = true;
+        }
+      } catch { /* clipboard blocked — link is still shown below */ }
+
+      const decC = d.decision === 'SIGNAL' ? 'g bold' : d.decision === 'SCAN' ? 'y' : 'r';
+      return [
+        boxTop(`share: $${esc(clean)}`),
+        blankRow(),
+        row(`<span class="w bold" style="font-size:28px;line-height:1">${d.score}</span> <span class="dim">/100</span>  <span class="${decC}">${esc(d.safety)}</span>`),
+        row(`<span class="dim">${esc(d.verdict)}</span>`),
+        blankRow(),
+        div(),
+        row(`<span class="dim">clarity card</span>`),
+        row(`<a href="${cardUrl}" target="_blank" rel="noopener" class="c">${cardUrl}</a>`),
+        blankRow(),
+        row(`<span class="dim">share link ${copied ? '<span class="g">(copied ✓)</span>' : ''}</span>`),
+        row(`<a href="${embedUrl}" target="_blank" rel="noopener" class="c">${embedUrl}</a>`),
+        blankRow(),
+        row(`<a href="${tweetUrl}" target="_blank" rel="noopener" class="g bold">→ post to X ↗</a>`),
+        blankRow(),
+        boxBottom(),
+        '',
+      ];
+    },
+
   };
 
-  const ALIASES = { h: 'help', s: 'status', t: 'targets', p: 'portfolio', w: 'wallet', c: 'clear', d: 'deploy', g: 'gas', l: 'log', lb: 'leaderboard', tk: 'token', sc: 'score' };
+  const ALIASES = { h: 'help', s: 'status', t: 'targets', p: 'portfolio', w: 'wallet', c: 'clear', d: 'deploy', g: 'gas', l: 'log', lb: 'leaderboard', tk: 'token', sc: 'score', sh: 'share' };
   const ALL = [...Object.keys(COMMANDS), ...Object.keys(ALIASES)];
 
   async function exec(input) {
