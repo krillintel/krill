@@ -9,6 +9,7 @@ dist/
 .idea/
 .wrangler/
 package-lock.json
+!worker/package-lock.json
 *.mp4
 *.webm
 assets/
