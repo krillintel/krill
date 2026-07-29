@@ -32,6 +32,34 @@ async function call(path, method = 'GET', body = null) {
   return { res, data: await res.json() };
 }
 
+// Minimal in-memory KV that mirrors the subset of the Cloudflare KV API the
+// worker actually uses (get/put/delete/list). Lets us exercise the stateful
+// watch/verdict-change flow without a real KV binding. `seed` pre-populates keys.
+function makeKV(seed = {}) {
+  const store = new Map(Object.entries(seed));
+  return {
+    store,
+    async get(k) { return store.has(k) ? store.get(k) : null; },
+    async put(k, v) { store.set(k, String(v)); },
+    async delete(k) { store.delete(k); },
+    async list({ prefix = '' } = {}) {
+      return { keys: [...store.keys()].filter(k => k.startsWith(prefix)).map(name => ({ name })), list_complete: true };
+    },
+  };
+}
+
+// Call an endpoint against a custom env (e.g. one carrying a mock KV binding).
+// Sends an X-API-Key so these requests use the keyed rate-limit bucket (600/min)
+// instead of draining the shared anonymous 60/min budget the rest of the suite
+// relies on — otherwise a burst of watch-flow calls would 429 unrelated tests.
+async function callEnv(customEnv, path, method = 'GET', body = null) {
+  const opts = { method, headers: { 'Content-Type': 'application/json', 'X-API-Key': 'test-watch-suite' } };
+  if (body) opts.body = JSON.stringify(body);
+  const req = new Request(`http://localhost/api${path}`, opts);
+  const res = await worker.fetch(req, customEnv);
+  return { res, data: await res.json() };
+}
+
 // A realistic on-chain snapshot for $KRILL, matching what getTokenOnChain()
 // returns when the RPC + indexer are live. Used to unit-test the pure scorer.
 // Includes an assessed GoPlus safety block (honeypot status returned) — that is
@@ -878,6 +906,148 @@ describe('404 handling', () => {
     const req = new Request('http://localhost/random', { method: 'GET' });
     const res = await worker.fetch(req, env);
     expect(res.status).toBe(404);
+  });
+});
+
+// ─── Verdict-change watch (krill-watch feature) ──────────────────────────────
+// The watch flow is stateful: it persists a watchlist + per-token last-seen
+// verdict in KV, then fires ALERT_WEBHOOK_URL only when a verdict flips. These
+// tests drive it through the public HTTP routes with an in-memory KV so the
+// contract stays honest end-to-end (route → KV → webhook).
+describe('POST /api/watch', () => {
+  it('adds a resolvable token and reports the watch count + webhook state', async () => {
+    const kv = makeKV();
+    const { res, data } = await callEnv({ KRILL_INDEX: kv }, '/watch', 'POST', { token: '$KRILL' });
+    expect(res.status).toBe(200);
+    expect(data.ok).toBe(true);
+    expect(data.watching).toBe(1);
+    // contract is normalized to the canonical $KRILL address, lowercased.
+    expect(data.contract.toLowerCase()).toBe('0x9d08407b8511249bec898856c506dd7c5972e7bb');
+    // no ALERT_WEBHOOK_URL in this env → alerts would be silent, and we say so.
+    expect(data.webhook_configured).toBe(false);
+    expect(data.ts).toBeTypeOf('number');
+    // the address actually landed in the KV watchlist (stored lowercased).
+    expect(JSON.parse(await kv.get('watch:tokens'))).toContain(data.contract.toLowerCase());
+  });
+
+  it('reflects a configured webhook when ALERT_WEBHOOK_URL is set', async () => {
+    const kv = makeKV();
+    const { data } = await callEnv(
+      { KRILL_INDEX: kv, ALERT_WEBHOOK_URL: 'https://example.com/hook' },
+      '/watch', 'POST', { token: '$KRILL' },
+    );
+    expect(data.webhook_configured).toBe(true);
+  });
+
+  it('is idempotent — watching the same token twice does not duplicate it', async () => {
+    const kv = makeKV();
+    const envKV = { KRILL_INDEX: kv };
+    await callEnv(envKV, '/watch', 'POST', { token: '$KRILL' });
+    const { data } = await callEnv(envKV, '/watch', 'POST', { token: 'krill' });
+    expect(data.watching).toBe(1);
+    expect(JSON.parse(await kv.get('watch:tokens')).length).toBe(1);
+  });
+
+  it('rejects a token that does not resolve to a contract address', async () => {
+    const kv = makeKV();
+    const { data } = await callEnv({ KRILL_INDEX: kv }, '/watch', 'POST', { token: 'NOTAREALTOKEN' });
+    expect(data.error).toBeTypeOf('string');
+    expect(data.watching).toBeUndefined();
+    // nothing was written to KV on a rejected add.
+    expect(await kv.get('watch:tokens')).toBe(null);
+  });
+
+  it('caps the watchlist at 25 tokens (oldest evicted, newest kept)', async () => {
+    // Pre-seed a full 25-entry list, then add one more via the route.
+    const seeded = Array.from({ length: 25 }, (_, i) => '0x' + String(i).padStart(40, '0'));
+    const kv = makeKV({ 'watch:tokens': JSON.stringify(seeded) });
+    const { data } = await callEnv({ KRILL_INDEX: kv }, '/watch', 'POST', { token: '$KRILL' });
+    const list = JSON.parse(await kv.get('watch:tokens'));
+    expect(list.length).toBe(25);
+    expect(data.watching).toBe(25);
+    // newest ($KRILL) is at the head; the oldest seeded entry was evicted.
+    expect(list[0]).toBe('0x9d08407b8511249bec898856c506dd7c5972e7bb');
+    expect(list).not.toContain(seeded[24]);
+  });
+});
+
+describe('POST /api/watch/check', () => {
+  it('reports 0 checked when the watchlist is empty', async () => {
+    const kv = makeKV();
+    const { data } = await callEnv({ KRILL_INDEX: kv }, '/watch/check', 'POST');
+    expect(data.ok).toBe(true);
+    expect(data.checked).toBe(0);
+    expect(data.changed).toBe(0);
+  });
+
+  it('records a silent baseline on first observation (no alert on first sight)', async () => {
+    const kv = makeKV({ 'watch:tokens': JSON.stringify(['0x9d08407b8511249bec898856c506dd7c5972e7bb']) });
+    const { data } = await callEnv({ KRILL_INDEX: kv }, '/watch/check', 'POST');
+    expect(data.checked).toBe(1);
+    expect(data.changed).toBe(0); // baseline is silent
+    // a last-seen state row now exists for the token.
+    const state = await kv.get('watch:last:0x9d08407b8511249bec898856c506dd7c5972e7bb');
+    expect(state).toBeTruthy();
+    expect(JSON.parse(state)).toHaveProperty('safety');
+  });
+
+  it('fires the webhook exactly once when a verdict flips, then re-baselines', async () => {
+    const addr = '0x9d08407b8511249bec898856c506dd7c5972e7bb';
+    // Seed a stale last-seen verdict that disagrees with the current (no-RPC)
+    // read, so the checker sees a flip on this tick.
+    const kv = makeKV({
+      'watch:tokens': JSON.stringify([addr]),
+      ['watch:last:' + addr]: JSON.stringify({ action: 'PROCEED', safety: 'SAFE', score: 83, ts: 1 }),
+    });
+    const hits = [];
+    const fetchSpy = async (url, init) => { hits.push({ url, body: JSON.parse(init.body) }); return new Response('ok'); };
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = fetchSpy;
+    try {
+      const { data } = await callEnv(
+        { KRILL_INDEX: kv, ALERT_WEBHOOK_URL: 'https://example.com/hook' },
+        '/watch/check', 'POST',
+      );
+      expect(data.checked).toBe(1);
+      expect(data.changed).toBe(1);
+      // webhook fired once with the documented verdict_change shape.
+      expect(hits.length).toBe(1);
+      expect(hits[0].url).toBe('https://example.com/hook');
+      const p = hits[0].body;
+      expect(p.type).toBe('verdict_change');
+      expect(p.contract).toBe(addr);
+      expect(p.from).toMatchObject({ action: 'PROCEED', safety: 'SAFE' });
+      expect(p.to).toHaveProperty('safety');
+      expect(p.ts).toBeTypeOf('number');
+      // KV was re-baselined to the new verdict, so a second tick is quiet.
+      hits.length = 0;
+      const second = await callEnv(
+        { KRILL_INDEX: kv, ALERT_WEBHOOK_URL: 'https://example.com/hook' },
+        '/watch/check', 'POST',
+      );
+      expect(second.data.changed).toBe(0);
+      expect(hits.length).toBe(0);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it('does not fire the webhook when a verdict is unchanged', async () => {
+    const addr = '0x9d08407b8511249bec898856c506dd7c5972e7bb';
+    // First pass to establish the true current baseline in KV.
+    const kv = makeKV({ 'watch:tokens': JSON.stringify([addr]) });
+    const envKV = { KRILL_INDEX: kv, ALERT_WEBHOOK_URL: 'https://example.com/hook' };
+    await callEnv(envKV, '/watch/check', 'POST'); // silent baseline
+    const hits = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init) => { hits.push(url); return new Response('ok'); };
+    try {
+      const { data } = await callEnv(envKV, '/watch/check', 'POST');
+      expect(data.changed).toBe(0);
+      expect(hits.length).toBe(0);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 });
 
