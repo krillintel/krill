@@ -15,7 +15,7 @@ import worker, {
   rateCheck,
   mem,
 } from './index.js';
-import { parseScanTarget, isScanRequest } from './xbot.js';
+import { parseScanTarget, isScanRequest, pollMentions } from './xbot.js';
 
 // Test env has no RPC_URL and no AI binding, so getTokenOnChain() returns
 // { onChain: false } and every score is null. That is the honest contract:
@@ -564,6 +564,196 @@ describe('xbot isScanRequest', () => {
   it('is false for an unrelated mention', () => {
     expect(isScanRequest('gm @krillintel love the shrimp')).toBe(false);
     expect(isScanRequest('')).toBe(false);
+  });
+});
+
+// ─── xbot pollMentions reply flow ────────────────────────────────────────────
+// The reply pipeline is where the bot could misbehave: double-reply, spam a
+// single user, blow the hourly cap, reply to itself, or crash the whole batch
+// on one bad mention. None of that logic was covered. These drive pollMentions
+// end-to-end with an in-memory KV + a stubbed global fetch that routes by URL
+// (mentions read / media upload / reply post) so we can assert exactly what the
+// bot would send to X — without touching the network.
+describe('xbot pollMentions reply flow', () => {
+  const BOT_ID = '2077997605699956736';
+  const KRILL_ADDR = '0x9D08407b8511249bec898856C506dD7c5972E7BB';
+
+  // env with all posting creds set + link reply-mode (image mode needs the
+  // rasterizer; link mode exercises the same guards without media upload).
+  function botEnv(kv, over = {}) {
+    return {
+      KRILL_INDEX: kv,
+      X_BOT_USER_ID: BOT_ID,
+      X_BEARER_TOKEN: 'bearer',
+      X_API_KEY: 'ak', X_API_SECRET: 'as',
+      X_ACCESS_TOKEN: 'at', X_ACCESS_SECRET: 'ats',
+      X_REPLY_MODE: 'link',
+      ...over,
+    };
+  }
+
+  // Minimal deps: buildCardData returns a no-data card (the RPC-less contract),
+  // renderCardPng should never be hit in link mode.
+  const deps = {
+    origin: 'https://krill.live',
+    buildCardData: async () => ({ disp: { symbol: 'KRILL' }, r: { score: null, safety: 'NO DATA' } }),
+    renderCardPng: async () => { throw new Error('renderCardPng should not run in link mode'); },
+  };
+
+  // Install a fake global fetch. `mentions` is the array returned by the read;
+  // every POST to /2/tweets is captured in `posts`. Returns { posts, restore }.
+  function stubFetch(mentions) {
+    const posts = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = async (input, init = {}) => {
+      // input may be a string, a URL (mentions read), or a Request.
+      const url = typeof input === 'string' ? input
+        : input instanceof URL ? input.href
+        : (input.url || String(input));
+      if (url.includes('/mentions')) {
+        return new Response(JSON.stringify({ data: mentions }), { status: 200 });
+      }
+      if (url.includes('/2/tweets')) {
+        posts.push(JSON.parse(init.body));
+        return new Response(JSON.stringify({ data: { id: '999' } }), { status: 201 });
+      }
+      if (url.includes('media/upload')) {
+        return new Response(JSON.stringify({ media_id_string: 'm123' }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    };
+    return { posts, restore: () => { globalThis.fetch = orig; } };
+  }
+
+  it('replies once to a genuine scan request', async () => {
+    const kv = makeKV();
+    const { posts, restore } = stubFetch([
+      { id: '100', author_id: 'user1', text: `@krillintel scan ${KRILL_ADDR}` },
+    ]);
+    try {
+      const out = await pollMentions(botEnv(kv), deps);
+      expect(out.checked).toBe(1);
+      expect(out.answered).toBe(1);
+      expect(posts.length).toBe(1);
+      expect(posts[0].reply.in_reply_to_tweet_id).toBe('100');
+      // dedupe + cooldown markers were written.
+      expect(await kv.get('xbot:done:100')).toBe('1');
+      expect(await kv.get('xbot:user:user1')).toBe('1');
+      // since_id advanced to the processed tweet.
+      expect(await kv.get('xbot:since_id')).toBe('100');
+    } finally { restore(); }
+  });
+
+  it('never replies to its own tweets (no self-mention loop)', async () => {
+    const kv = makeKV();
+    const { posts, restore } = stubFetch([
+      { id: '101', author_id: BOT_ID, text: `check ${KRILL_ADDR}` },
+    ]);
+    try {
+      const out = await pollMentions(botEnv(kv), deps);
+      expect(out.answered).toBe(0);
+      expect(posts.length).toBe(0);
+      expect(await kv.get('xbot:done:101')).toBe('1'); // consumed, won't retry
+    } finally { restore(); }
+  });
+
+  it('ignores non-scan mentions without replying', async () => {
+    const kv = makeKV();
+    const { posts, restore } = stubFetch([
+      { id: '102', author_id: 'user2', text: 'gm @krillintel love the shrimp 🦐' },
+    ]);
+    try {
+      const out = await pollMentions(botEnv(kv), deps);
+      expect(out.answered).toBe(0);
+      expect(posts.length).toBe(0);
+      expect(await kv.get('xbot:done:102')).toBe('1'); // marked so we don't reconsider
+    } finally { restore(); }
+  });
+
+  it('does not answer a tweet twice (dedupe via KV)', async () => {
+    const kv = makeKV({ 'xbot:done:103': '1' });
+    const { posts, restore } = stubFetch([
+      { id: '103', author_id: 'user3', text: `scan ${KRILL_ADDR}` },
+    ]);
+    try {
+      const out = await pollMentions(botEnv(kv), deps);
+      expect(out.answered).toBe(0);
+      expect(posts.length).toBe(0);
+    } finally { restore(); }
+  });
+
+  it('enforces the per-author cooldown', async () => {
+    // user4 is already on cooldown → their new scan request is skipped.
+    const kv = makeKV({ 'xbot:user:user4': '1' });
+    const { posts, restore } = stubFetch([
+      { id: '104', author_id: 'user4', text: `scan ${KRILL_ADDR}` },
+    ]);
+    try {
+      const out = await pollMentions(botEnv(kv), deps);
+      expect(out.answered).toBe(0);
+      expect(out.skippedUser).toBe(1);
+      expect(posts.length).toBe(0);
+    } finally { restore(); }
+  });
+
+  it('honours the global hourly cap and leaves overflow for the next cycle', async () => {
+    // cap = 1: first mention answered, second deferred (since_id NOT advanced
+    // past it so it's retried later).
+    const kv = makeKV();
+    const { posts, restore } = stubFetch([
+      { id: '105', author_id: 'a', text: `scan ${KRILL_ADDR}` },
+      { id: '106', author_id: 'b', text: `scan ${KRILL_ADDR}` },
+    ]);
+    try {
+      const out = await pollMentions(botEnv(kv, { X_MAX_REPLIES_PER_HOUR: '1' }), deps);
+      expect(out.answered).toBe(1);
+      expect(out.skippedRate).toBe(1);
+      expect(posts.length).toBe(1);
+      // since_id must NOT advance when we hit the cap (retry the overflow).
+      expect(await kv.get('xbot:since_id')).toBe(null);
+    } finally { restore(); }
+  });
+
+  it('replies to each distinct user in one batch (one per author)', async () => {
+    const kv = makeKV();
+    const { posts, restore } = stubFetch([
+      { id: '107', author_id: 'x', text: `scan ${KRILL_ADDR}` },
+      { id: '108', author_id: 'y', text: `is this safe ${KRILL_ADDR}` },
+    ]);
+    try {
+      const out = await pollMentions(botEnv(kv), deps);
+      expect(out.answered).toBe(2);
+      expect(posts.length).toBe(2);
+      expect(await kv.get('xbot:since_id')).toBe('108');
+    } finally { restore(); }
+  });
+
+  it('one bad mention does not abort the whole batch', async () => {
+    const kv = makeKV();
+    // buildCardData throws for the first tweet, succeeds for the second.
+    let n = 0;
+    const flakyDeps = {
+      ...deps,
+      buildCardData: async () => {
+        if (n++ === 0) throw new Error('boom');
+        return { disp: { symbol: 'KRILL' }, r: { score: null, safety: 'NO DATA' } };
+      },
+    };
+    const { posts, restore } = stubFetch([
+      { id: '109', author_id: 'p', text: `scan ${KRILL_ADDR}` },
+      { id: '110', author_id: 'q', text: `scan ${KRILL_ADDR}` },
+    ]);
+    try {
+      const out = await pollMentions(botEnv(kv), flakyDeps);
+      expect(out.answered).toBe(1); // the second one still went through
+      expect(posts.length).toBe(1);
+    } finally { restore(); }
+  });
+
+  it('skips cleanly when credentials are missing (no fetch, no throw)', async () => {
+    const kv = makeKV();
+    const out = await pollMentions({ KRILL_INDEX: kv }, deps);
+    expect(out.skipped).toBe('x-credentials-missing');
   });
 });
 
