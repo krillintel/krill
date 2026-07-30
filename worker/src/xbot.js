@@ -261,16 +261,34 @@ export async function pollMentions(env, deps) {
   }
   if (!mentions.length) return { checked: 0 };
 
-  // Process oldest-first so since_id advances monotonically.
-  mentions.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
-  let answered = 0, skippedRate = 0, skippedUser = 0;
-  let maxId = sinceId ? BigInt(sinceId) : 0n;
+  // BigInt() throws a SyntaxError on anything non-numeric. Tweet ids come from a
+  // remote API and since_id comes from KV, so neither is guaranteed parseable —
+  // and an unguarded throw here would escape the per-mention try/catch below and
+  // abandon the whole batch (dropping every remaining mention AND leaving
+  // since_id unadvanced, so the next cycle re-reads the same poison record).
+  const toBig = (v) => {
+    try { return BigInt(v); } catch { return null; }
+  };
+
+  // Process oldest-first so since_id advances monotonically. Unparseable ids sort
+  // last rather than blowing up the comparator.
+  mentions.sort((a, b) => {
+    const x = toBig(a.id), y = toBig(b.id);
+    if (x == null || y == null) return x == null ? 1 : -1;
+    return x < y ? -1 : 1;
+  });
+  let answered = 0, skippedRate = 0, skippedUser = 0, skippedBadId = 0;
+  let maxId = toBig(sinceId) ?? 0n;
   // Pull the current hour count once; increment locally as we reply so we stay
   // under the cap even within a single batch.
   let hourCount = await hourlyCount(env);
 
   for (const tw of mentions) {
-    if (BigInt(tw.id) > maxId) maxId = BigInt(tw.id);
+    const id = toBig(tw.id);
+    // A malformed id can't be deduped or checkpointed — skip it instead of
+    // letting it poison the batch.
+    if (id == null) { skippedBadId++; continue; }
+    if (id > maxId) maxId = id;
     try {
       if (await alreadyAnswered(env, tw.id)) continue;
       if (!isScanRequest(tw.text)) {
@@ -325,7 +343,7 @@ export async function pollMentions(env, deps) {
   if (skippedRate === 0) {
     await setSinceId(env, maxId.toString());
   }
-  return { checked: mentions.length, answered, skippedRate, skippedUser, hourCount, maxPerHour };
+  return { checked: mentions.length, answered, skippedRate, skippedUser, skippedBadId, hourCount, maxPerHour };
 }
 
 // exported for unit tests

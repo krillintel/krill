@@ -13,6 +13,7 @@ import { pollMentions } from './xbot.js';
 import { OPENAPI_SPEC } from './openapi.js';
 
 const CA = '0x9D08407b8511249bec898856C506dD7c5972E7BB'; // $KRILL ERC-20 on Robinhood Chain
+const KRILL_DECIMALS = 18;   // $KRILL is the gate token; its own decimals, not a scanned token's
 const CHAIN_ID = 4663; // Robinhood chain
 
 // Robinhood Chain block explorer (Blockscout). Exposes a real, chain-wide
@@ -41,6 +42,10 @@ const mem = {
 };
 
 const CACHE_TTL = 30000;
+// How long an EXPIRED in-memory read may still be served when the RPC is down.
+// Beyond this we report no data rather than presenting an old verdict as current.
+const STALE_GRACE_MS = 300000; // 5 min
+const TOKEN_CACHE_MAX = 200;   // prune the per-isolate token cache past this size
 
 // Rate-limit config. Keyed callers get a higher ceiling than anonymous IPs, so
 // issuing an API key is the path to more throughput (monetization hook).
@@ -151,6 +156,32 @@ const KV_CACHE_DEGRADED_TTL_MS = 45000; // 45s: degraded/shell read — cache th
 // Read a token snapshot from KV. A snapshot is tagged `full:true` when GoPlus
 // actually assessed the token; degraded snapshots (fail-closed CAUTION) carry
 // `full:false` and expire faster so a token that GoPlus later assesses can be
+// The token cache gains a permanent entry per distinct address scanned. A
+// long-lived isolate walking the discovery list would grow it without bound, so
+// drop entries that are past the stale grace window (they can never be served
+// again) once the map gets large. Cheap, and only runs on a cache write.
+function pruneTokenCache(now) {
+  const entries = Object.keys(mem.cache.tokenData);
+  if (entries.length <= TOKEN_CACHE_MAX) return;
+  for (const k of entries) {
+    const e = mem.cache.tokenData[k];
+    if (!e || now - e.ts > STALE_GRACE_MS) delete mem.cache.tokenData[k];
+  }
+}
+
+// KV values are strings we wrote, but a truncated write, a schema change across
+// deploys, or a manual edit can leave a value that doesn't parse. An unguarded
+// JSON.parse on a request path turns that into a permanent 500 on the route (the
+// bad value is re-read on every call), so parse defensively and fall back to the
+// caller's default instead of taking the endpoint down.
+function safeParse(raw, fallback = null) {
+  if (raw == null) return fallback;
+  try {
+    const v = JSON.parse(raw);
+    return v == null ? fallback : v;
+  } catch { return fallback; }
+}
+
 // re-graded quickly. TTL is chosen per-tier from the tag.
 async function kvTokenGet(env, key) {
   if (!env?.KRILL_INDEX) return null;
@@ -302,6 +333,9 @@ function encodeErc20Call(selector, address) {
 }
 
 // ── ERC-20 balanceOf(address) → token balance (human units) ──
+// NOTE: this always reads the $KRILL contract (`to: CA`) because $KRILL is the
+// gate token. `decimals` therefore describes $KRILL, never a scanned token —
+// passing a scanned token's decimals here would misscale the gate balance.
 async function erc20BalanceOf(wallet, env, decimals = 18) {
   const data = encodeErc20Call('0x70a08231', wallet); // balanceOf(address)
   const hex = await rpcCall('eth_call', [{ to: CA, data }, 'latest'], env);
@@ -407,10 +441,16 @@ function contractSafetyScore(gp) {
 // trap is a core rug vector: a token looks clean until the owner bumps tax post-buy.
 // This signal reads: current buy/sell tax levels + whether tax is modifiable.
 function taxAnalysisScore(gp) {
-  if (!gp || (gp.buyTax == null && gp.sellTax == null && gp.slippageModifiable == null)) return null;
+  // Fail closed on an unknown tax LEVEL. On Robinhood Chain GoPlus routinely
+  // returns blank buy_tax/sell_tax while still populating slippage_modifiable,
+  // so requiring all three to be absent left the common case scoring a perfect
+  // 100 with "no tax detected" — an unmeasured signal asserting it was clean.
+  // An undisclosed 99% sell tax would have read as 0%. Tax mutability is still
+  // reported separately: it drives a CAUTION via the agent verdict.
+  if (!gp || gp.buyTax == null || gp.sellTax == null) return null;
   let s = 100;
-  const buyPct = gp.buyTax != null ? gp.buyTax * 100 : 0;   // GoPlus returns 0.05 = 5%
-  const sellPct = gp.sellTax != null ? gp.sellTax * 100 : 0;
+  const buyPct = gp.buyTax * 100;   // GoPlus returns 0.05 = 5%
+  const sellPct = gp.sellTax * 100;
   // High buy tax
   if (buyPct >= 50) s -= 50;
   else if (buyPct >= 20) s -= 35;
@@ -542,6 +582,17 @@ function buildAgentVerdict({ score, safety, decision, gp, gpFlags, txFlags, limi
     if (gp.slippageModifiable === true) {
       highRiskReasons.push('tax is modifiable by owner — sell tax could be raised after you buy');
     }
+    // 1c. Exit-denial vectors. Neither is a confirmed scam on its own — both are
+    // present on legitimate regulated tokens (USDC is pausable AND has a
+    // blacklist) — but each lets the issuer stop you selling, which is a
+    // honeypot in effect. They only cost graded points in the composite score,
+    // which a strong read can absorb, so surface them here to force CAUTION.
+    if (gp.transferPausable === true) {
+      highRiskReasons.push('transfers can be paused by the owner — you could be frozen out of selling');
+    }
+    if (gp.isBlacklisted === true) {
+      highRiskReasons.push('addresses can be blacklisted — your wallet could be blocked from selling');
+    }
   }
 
   const isScam = gp && gp.isHoneypot === true;
@@ -618,13 +669,31 @@ function computeScore(token, tokenData) {
   // Holder distribution needs the KV indexer to have produced real stats.
   // Only $KRILL is indexed today; other on-chain tokens still get a contract
   // integrity read, but their holder distribution stays pending (not faked).
-  const hasHolders = hasChain && td.holderIndexed && td.holderCount != null;
+  // BOTH parts must be known: holderCount alone is not enough. topHolderPct is
+  // independently nullable (a partial Blockscout read, or the GoPlus
+  // holder_count fallback, yields a count with no concentration), and whale
+  // concentration is the dominant rug signal. Defaulting an unknown percentage
+  // to 0 would score "we don't know" as the most favourable possible value —
+  // a 99%-whale token would read 100/100 and green-light as SAFE.
+  const hasHolders = hasChain && td.holderIndexed
+    && td.holderCount != null && td.topHolderPct != null;
   // GoPlus security flags (honeypot, mintable, proxy, hidden owner, etc.).
   // A read only counts as real safety data if GoPlus actually ASSESSED the token
   // (honeypot status returned). A shell read (assessed:false) is treated as "no
   // safety data" so unknown can never green-light as safe — the gate fails closed.
   const gpRaw = hasChain && td.safety ? td.safety : null;
-  const safetyAssessed = !!(gpRaw && gpRaw.assessed);
+  // Trust `assessed` only if the hard-danger set is actually present. Every flag
+  // check downstream is `=== true`, so a null (unknown) drain flag is scored
+  // identically to a confirmed-absent one — an unknown hidden owner would cost
+  // nothing and still reach PROCEED. getTokenSafety enforces the same rule at
+  // parse time; this re-checks it here because `safety` can also arrive from the
+  // KV token cache (written by an older deploy, or by a different code path),
+  // and a false SAFE is the worst possible output for this product.
+  const safetyAssessed = !!(gpRaw && gpRaw.assessed
+    && gpRaw.isHoneypot != null
+    && gpRaw.hiddenOwner != null
+    && gpRaw.canTakeBackOwnership != null
+    && gpRaw.selfdestruct != null);
   const gp = safetyAssessed ? gpRaw : null;
   const hasSafety = !!gp;
   const gpFlags = hasSafety ? safetyFlags(gp) : [];
@@ -646,7 +715,7 @@ function computeScore(token, tokenData) {
     {
       name: 'holder_distribution', weight: 40,
       available: hasHolders,
-      value: hasHolders ? distributionScore(td.topHolderPct || 0, td.holderCount || 0) : null,
+      value: hasHolders ? distributionScore(td.topHolderPct, td.holderCount) : null,
       source: 'on-chain holder indexer',
       data_source: {
         provider: 'Blockscout / KV indexer',
@@ -686,7 +755,7 @@ function computeScore(token, tokenData) {
       },
       note: hasTax
         ? (txFlags.length ? txFlags.join(', ') : 'no tax detected')
-        : (hasChain ? 'tax data unavailable' : 'no contract found'),
+        : (hasChain ? 'tax level not reported — unknown, not assumed 0%' : 'no contract found'),
     },
     {
       name: 'contract_integrity', weight: 20,
@@ -826,7 +895,7 @@ function computeScore(token, tokenData) {
 
   const decision = score >= 70 ? 'SIGNAL' : score >= 50 ? 'SCAN' : 'SKIP';
   const label = score >= 70 ? 'READABLE' : score >= 50 ? 'MIXED' : 'NOISY';
-  const safety = score >= 70 ? 'SAFE' : score >= 50 ? 'CAUTION' : 'NOT SAFE';
+  const scoreSafety = score >= 70 ? 'SAFE' : score >= 50 ? 'CAUTION' : 'NOT SAFE';
 
   const verdict = score >= 70
     ? `Strong ${strong.name.replace(/_/g, ' ')}; watch ${weak.name.replace(/_/g, ' ')}. Clean read on ${live.length}/${signals.length} signals.${pendingNote}`
@@ -834,8 +903,20 @@ function computeScore(token, tokenData) {
     ? `Readable but uneven — ${weak.name.replace(/_/g, ' ')} is the risk to watch.${pendingNote}`
     : `Hard to read: weak ${weak.name.replace(/_/g, ' ')}. Treat with caution.${pendingNote}`;
 
-  const agent = buildAgentVerdict({ score, safety, decision, gp, gpFlags, txFlags, limited, hasSafety, holderMeasured });
-  return { score, label, decision, safety, signals, coverage, agent, verdict };
+  const agent = buildAgentVerdict({ score, safety: scoreSafety, decision, gp, gpFlags, txFlags, limited, hasSafety, holderMeasured });
+
+  // Human/agent parity (fail closed). The score above is a weighted average, so a
+  // strong read can absorb a graded penalty and still land >= 70 — meaning the
+  // card could say SAFE while the agent verdict says CAUTION for the very same
+  // token (e.g. tax modifiable by owner, or pausable transfers). The hard-danger
+  // override already keeps the STOP direction in lockstep; this closes the
+  // CAUTION direction. If the agent will not proceed, a human must not read SAFE.
+  const safety = (agent.action !== 'PROCEED' && scoreSafety === 'SAFE') ? 'CAUTION' : scoreSafety;
+  const finalVerdict = safety === scoreSafety
+    ? verdict
+    : `${verdict} Not confirmed safe: ${agent.reasons[0]}.`;
+
+  return { score, label, decision, safety, signals, coverage, agent, verdict: finalVerdict };
 }
 
 // ══════════ SHARE CARD (SVG) ══════════
@@ -1289,7 +1370,15 @@ async function getTokenSafety(env, address) {
       // as usable safety data. `assessed` gates that: only a read that actually
       // evaluated honeypot status counts, and everything downstream fails closed
       // (LIMITED/CAUTION, never PROCEED) when it's false.
-      assessed: b01(t.is_honeypot) !== null,
+      //
+      // Honeypot alone is NOT sufficient. GoPlus can return is_honeypot while
+      // dropping other fields, and every downstream flag check is `=== true` —
+      // so a null (unknown) drain flag scores identically to a confirmed-absent
+      // one. That would let a hidden owner or reclaimable ownership pass
+      // invisibly and still reach PROCEED. Require the whole hard-danger set to
+      // be present before trusting the read as real safety data.
+      assessed: [t.is_honeypot, t.hidden_owner, t.can_take_back_ownership, t.selfdestruct]
+        .every(v => b01(v) !== null),
     };
   } catch {
     return null;
@@ -1324,7 +1413,12 @@ async function getTokenOnChain(env, address = CA) {
     const hasCode = !!codeHex && codeHex !== '0x' && codeHex.length > 2;
     // No contract deployed at this address → nothing to read on-chain.
     if (!hasCode) return { onChain: false, hasCode: false };
-    const decimals = decimalsHex && decimalsHex !== '0x' ? (parseInt(decimalsHex, 16) || 18) : 18;
+    // `|| 18` would silently rewrite a legitimate decimals() == 0 (legal ERC-20)
+    // into 18, throwing totalSupply off by 18 orders of magnitude AND wrongly
+    // awarding the "standard ERC-20" integrity bonus. Only fall back when the
+    // value genuinely didn't parse.
+    const parsedDecimals = decimalsHex && decimalsHex !== '0x' ? parseInt(decimalsHex, 16) : NaN;
+    const decimals = Number.isFinite(parsedDecimals) ? parsedDecimals : 18;
     const totalSupply = supplyHex && supplyHex !== '0x' ? parseInt(supplyHex, 16) / Math.pow(10, decimals) : 0;
     // owner() returns a 32-byte word; renounced == zero address (or no owner() fn)
     const owner = ownerHex && ownerHex !== '0x' ? '0x' + ownerHex.slice(-40).toLowerCase() : null;
@@ -1381,13 +1475,23 @@ async function getTokenOnChain(env, address = CA) {
     // the whole 30s window (which would falsely down-rank the token to LIMITED).
     const ts = hasHolderStats ? now : now - (CACHE_TTL - 5000);
     mem.cache.tokenData[key] = { data: result, ts };
+    pruneTokenCache(now);
     // Persist to KV so every isolate serves the same verdict for the window.
     // kvTokenPut only stores a complete read (GoPlus safety present), so a
     // transient rate-limited response never becomes the cached truth.
     await kvTokenPut(env, key, result);
     return result;
   } catch {
-    return (cached && cached.data) || { onChain: false };
+    // The RPC read failed. `cached` is already known to be EXPIRED (a fresh hit
+    // returned above), so serving it unconditionally would hand back an
+    // arbitrarily old verdict — a safety read from hours ago, presented as
+    // current, with no marker. For a gate whose whole promise is "the rug isn't
+    // one moment", that is the wrong direction to fail. Serve a stale read only
+    // inside a bounded grace window, and mark it so callers can tell.
+    if (cached && cached.data && now - cached.ts < STALE_GRACE_MS) {
+      return { ...cached.data, stale: true, staleAgeMs: now - cached.ts };
+    }
+    return { onChain: false };
   }
 }
 
@@ -1457,7 +1561,12 @@ async function advanceIndexer(env) {
       if (!lg.topics || lg.topics.length < 3) continue;
       const fromA = topicToAddr(lg.topics[1]);
       const toA = topicToAddr(lg.topics[2]);
-      const amt = BigInt(lg.data || '0x0');
+      // `lg.data || '0x0'` does NOT catch a bare '0x' (truthy), and BigInt('0x')
+      // throws. That throw is outside the try that wraps rpcCall, so a single
+      // malformed log would kill the tick before the checkpoint was written —
+      // permanently stalling the holder indexer that holder_distribution needs.
+      let amt;
+      try { amt = BigInt(lg.data && lg.data !== '0x' ? lg.data : '0x0'); } catch { continue; }
       if (fromA !== ZERO_ADDR) balances[fromA] = ((BigInt(balances[fromA] || '0')) - amt).toString();
       if (toA !== ZERO_ADDR) balances[toA] = ((BigInt(balances[toA] || '0')) + amt).toString();
     }
@@ -1541,8 +1650,8 @@ async function advanceDiscovery(env) {
 // Read the discovered-token list from KV (newest-first). Empty array if none.
 async function getDiscoveredTokens(env) {
   if (!env?.KRILL_INDEX) return [];
-  const raw = await env.KRILL_INDEX.get(DISC_LIST_KEY);
-  return raw ? JSON.parse(raw) : [];
+  const list = safeParse(await env.KRILL_INDEX.get(DISC_LIST_KEY), []);
+  return Array.isArray(list) ? list : [];
 }
 
 // ── Verdict-change webhook alerts ──
@@ -1557,8 +1666,8 @@ const WATCH_MAX = 25;
 
 async function getWatchList(env) {
   if (!env?.KRILL_INDEX) return [];
-  const raw = await env.KRILL_INDEX.get(WATCH_LIST_KEY);
-  return raw ? JSON.parse(raw) : [];
+  const list = safeParse(await env.KRILL_INDEX.get(WATCH_LIST_KEY), []);
+  return Array.isArray(list) ? list : [];
 }
 
 // Add a token to the verdict-change watchlist. Idempotent; capped at WATCH_MAX.
@@ -1604,8 +1713,9 @@ async function checkVerdictChanges(env) {
       const { r, tokenData } = await buildCardData(addr, env);
       const cur = { action: r.agent ? r.agent.action : 'NO DATA', safety: r.safety, score: r.score };
       const key = WATCH_STATE_PREFIX + addr;
-      const prevRaw = await env.KRILL_INDEX.get(key);
-      const prev = prevRaw ? JSON.parse(prevRaw) : null;
+      // A corrupt baseline must re-baseline silently, not throw — throwing here
+      // would abort the whole watch sweep for every token after this one.
+      const prev = safeParse(await env.KRILL_INDEX.get(key));
       // First observation: record silently (no alert on the baseline).
       if (!prev) {
         await env.KRILL_INDEX.put(key, JSON.stringify({ ...cur, ts: Date.now() }));
@@ -1634,9 +1744,8 @@ async function checkVerdictChanges(env) {
 // Read cached holder stats from KV (null if indexer hasn't produced any yet).
 async function getIndexedHolders(env) {
   if (!env?.KRILL_INDEX) return null;
-  const raw = await env.KRILL_INDEX.get(IDX_STATE_KEY);
-  if (!raw) return null;
-  const s = JSON.parse(raw);
+  const s = safeParse(await env.KRILL_INDEX.get(IDX_STATE_KEY));
+  if (!s) return null;
   if (!s.holderCount && s.holderCount !== 0) return null;
   return { holderCount: s.holderCount, topHolderPct: s.topHolderPct, done: !!s.done, syncedTo: s.fromBlock, tipBlock: s.tipBlock, updatedAt: s.updatedAt };
 }
@@ -1776,7 +1885,10 @@ const routes = {
     let access = { tier: 'PUBLIC', balance: 0, features: tierFor(0).features };
     if (isAddress(wallet)) {
       try {
-        const balance = await erc20BalanceOf(wallet, env, tokenData.decimals || 18);
+        // Gate balance is always $KRILL — do NOT scale by the SCANNED token's
+        // decimals. Scanning a 6-decimal token with ?wallet= used to inflate the
+        // reported balance by 1e12 and hand out a bogus WHALE tier.
+        const balance = await erc20BalanceOf(wallet, env, KRILL_DECIMALS);
         const t = tierFor(balance);
         access = { tier: t.tier, balance: Math.floor(balance), features: t.features };
       } catch { /* keep PUBLIC on RPC failure */ }
@@ -1910,7 +2022,7 @@ const routes = {
     if (!isAddress(wallet)) return { error: 'valid ?wallet=0x... required', tiers: GATE_TIERS };
     const tokenData = await getTokenOnChain(env);
     let balance = 0;
-    try { balance = await erc20BalanceOf(wallet, env, tokenData.decimals || 18); } catch {}
+    try { balance = await erc20BalanceOf(wallet, env, KRILL_DECIMALS); } catch {}
     const t = tierFor(balance);
     return {
       wallet: wallet.slice(0, 6) + '...' + wallet.slice(-4),
@@ -2232,8 +2344,7 @@ const routes = {
   // launches it has found so far.
   '/discovery-status': async (req, env) => {
     if (!env?.KRILL_INDEX) return { discovering: false, reason: 'KV not bound', ts: Date.now() };
-    const raw = await env.KRILL_INDEX.get(DISC_STATE_KEY);
-    const s = raw ? JSON.parse(raw) : null;
+    const s = safeParse(await env.KRILL_INDEX.get(DISC_STATE_KEY));
     const tokens = await getDiscoveredTokens(env);
     if (!s) return { discovering: false, reason: 'not started', found: tokens.length, ts: Date.now() };
     const span = s.tipBlock - FACTORY_BLOCK;
@@ -2249,6 +2360,41 @@ const routes = {
   },
 };
 
+// ── Admin-only mutating routes ──
+// These are operational kickers, not public API. Each one causes a real
+// side effect beyond the response, so leaving them open to the internet is a
+// standing liability:
+//   /xbot/poll     → posts real tweets from @krillintel and burns paid X quota
+//   /reindex       → KV writes; the free tier allows ~1000/day, so a caller at
+//                    the 60/min rate limit can exhaust the daily budget in under
+//                    20 minutes and silently stall the holder indexer
+//   /rediscover    → same KV write amplification
+//   /watch/check   → fires outbound POSTs to ALERT_WEBHOOK_URL (request amplifier)
+//   /mode          → mutates process-global state for every request on the isolate
+// The IP rate limiter is not a substitute: it fails OPEN when the Durable Object
+// binding is missing or errors, and 60/min is plenty to do the damage above.
+// /watch stays public on purpose — it's a documented user feature, idempotent,
+// and capped at WATCH_MAX entries.
+const ADMIN_ROUTES = new Set(['/reindex', '/rediscover', '/watch/check', '/xbot/poll', '/mode']);
+
+// Returns a Response when the caller must be rejected, or null to allow.
+// Fails CLOSED: if ADMIN_KEY isn't configured, these routes are unavailable
+// rather than open to everyone. The cron path calls the same functions directly,
+// so scheduled work is unaffected either way.
+function adminDenied(request, env) {
+  if (!env?.ADMIN_KEY) {
+    return json({
+      error: 'admin route disabled',
+      hint: 'set the ADMIN_KEY secret (wrangler secret put ADMIN_KEY) to enable manual kicks',
+    }, 503);
+  }
+  const supplied = request.headers.get('X-Admin-Key') || '';
+  if (supplied !== env.ADMIN_KEY) {
+    return json({ error: 'unauthorized', hint: 'send a valid X-Admin-Key header' }, 401);
+  }
+  return null;
+}
+
 // Risk ordering for the agent gate. An agent declares the worst risk it will
 // tolerate; anything above that is denied. `unknown` sits between low and high
 // on purpose — incomplete data is riskier than a clean read but not a confirmed
@@ -2256,7 +2402,12 @@ const routes = {
 const RISK_ORDER = { low: 0, unknown: 1, high: 2, critical: 3 };
 
 const postRoutes = {
-  '/mode': async (req) => { const b = await req.json(); mem.mode = b.mode === 'PAUSE' ? 'PAUSE' : 'SIGNAL'; return { mode: mem.mode }; },
+  // Every other POST route tolerates a malformed body; this one used to 500 on it.
+  '/mode': async (req) => {
+    const b = await req.json().catch(() => ({}));
+    mem.mode = b && b.mode === 'PAUSE' ? 'PAUSE' : 'SIGNAL';
+    return { mode: mem.mode };
+  },
 
   // Agent gate — the single-call branch primitive for autonomous agents.
   // POST { token, max_risk } → { allow, action, risk_level, is_scam, reason }.
@@ -2456,6 +2607,10 @@ export default {
     try {
       // Handlers may return a raw Response (e.g. the SVG share card); pass it through.
       if (request.method === 'POST' && postRoutes[route]) {
+        if (ADMIN_ROUTES.has(route)) {
+          const denied = adminDenied(request, env);
+          if (denied) return withRate(denied);
+        }
         const out = await postRoutes[route](request, env);
         return withRate(out instanceof Response ? out : json(out));
       }

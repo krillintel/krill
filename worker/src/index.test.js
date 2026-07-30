@@ -48,15 +48,29 @@ function makeKV(seed = {}) {
   };
 }
 
+// Shared secret for the admin-gated mutating routes (/reindex, /rediscover,
+// /watch/check, /xbot/poll, /mode). Those routes cause real side effects — real
+// tweets, KV write amplification, outbound webhooks — so they require a matching
+// X-Admin-Key and are unavailable entirely when ADMIN_KEY isn't configured.
+const TEST_ADMIN_KEY = 'test-admin-key';
+
 // Call an endpoint against a custom env (e.g. one carrying a mock KV binding).
 // Sends an X-API-Key so these requests use the keyed rate-limit bucket (600/min)
 // instead of draining the shared anonymous 60/min budget the rest of the suite
 // relies on — otherwise a burst of watch-flow calls would 429 unrelated tests.
+// Also carries admin creds so the gated operational routes are reachable.
 async function callEnv(customEnv, path, method = 'GET', body = null) {
-  const opts = { method, headers: { 'Content-Type': 'application/json', 'X-API-Key': 'test-watch-suite' } };
+  const opts = {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-API-Key': 'test-watch-suite',
+      'X-Admin-Key': TEST_ADMIN_KEY,
+    },
+  };
   if (body) opts.body = JSON.stringify(body);
   const req = new Request(`http://localhost/api${path}`, opts);
-  const res = await worker.fetch(req, customEnv);
+  const res = await worker.fetch(req, { ADMIN_KEY: TEST_ADMIN_KEY, ...customEnv });
   return { res, data: await res.json() };
 }
 
@@ -493,10 +507,141 @@ describe('computeScore (live on-chain data)', () => {
     };
     const clean = computeScore('0x3333333333333333333333333333333333333333', {
       ...liveOtherWithHolders,
-      safety: { isHoneypot: false, isOpenSource: true, assessed: true },
+      // Must be a COMPLETE hard-danger read, otherwise the fail-closed guard
+      // discards the safety block entirely and this stops being a clean-vs-flagged
+      // comparison (both sides would just lose the safety signal).
+      safety: {
+        isHoneypot: false, isOpenSource: true,
+        hiddenOwner: false, canTakeBackOwnership: false, selfdestruct: false,
+        assessed: true,
+      },
     });
     const r = computeScore('0x3333333333333333333333333333333333333333', flagged);
     expect(r.score).toBeLessThan(clean.score);
+  });
+});
+
+// The single worst failure mode for a safety gate is reporting SAFE on a token it
+// could not actually verify. Every check below is a regression test for a path
+// where incomplete or dangerous data previously scored as clean and reached
+// PROCEED. They assert the direction that matters: unknown must never be
+// rewarded, and a token an agent must not touch must never read SAFE.
+describe('computeScore fails closed on incomplete or dangerous data', () => {
+  const fullyClean = {
+    isHoneypot: false, isMintable: false, isProxy: false, isOpenSource: true,
+    hiddenOwner: false, canTakeBackOwnership: false, selfdestruct: false,
+    transferPausable: false, isBlacklisted: false, tradingCooldown: false,
+    buyTax: 0, sellTax: 0, slippageModifiable: false, assessed: true,
+  };
+
+  it('does not treat an unknown top-holder percentage as zero concentration', () => {
+    // holderCount resolved but concentration did not (partial explorer read, or
+    // the GoPlus holder_count fallback). Unknown concentration must not score as
+    // "no whale" — that is the most favourable value possible.
+    const r = computeScore('0x4444444444444444444444444444444444444444', {
+      ...liveOtherWithHolders, holderCount: 5000, topHolderPct: null,
+      safety: { ...fullyClean },
+    });
+    const hd = r.signals.find(s => s.name === 'holder_distribution');
+    expect(hd.available).toBe(false);
+    expect(hd.value).toBeNull();
+    expect(r.safety).not.toBe('SAFE');
+    expect(r.agent.safe_to_proceed).toBe(false);
+  });
+
+  it('still scores holder distribution when concentration IS known', () => {
+    // Guard against over-correcting: a complete holder read must stay measurable.
+    const r = computeScore('0x4444444444444444444444444444444444444444', {
+      ...liveOtherWithHolders, holderCount: 5000, topHolderPct: 4,
+      safety: { ...fullyClean },
+    });
+    const hd = r.signals.find(s => s.name === 'holder_distribution');
+    expect(hd.available).toBe(true);
+    expect(hd.value).toBeGreaterThan(0);
+    expect(r.safety).toBe('SAFE');
+    expect(r.agent.action).toBe('PROCEED');
+  });
+
+  it('rejects a safety read that is missing any hard-danger flag', () => {
+    // GoPlus can return is_honeypot and drop the rest. Every flag check is
+    // `=== true`, so an unknown hidden owner would cost nothing — the drain
+    // vector would be invisible while the token read SAFE.
+    for (const missing of ['hiddenOwner', 'canTakeBackOwnership', 'selfdestruct']) {
+      const safety = { ...fullyClean, [missing]: null };
+      const r = computeScore('0x4444444444444444444444444444444444444444', {
+        ...liveOtherWithHolders, safety,
+      });
+      expect(r.safety, `missing ${missing}`).not.toBe('SAFE');
+      expect(r.agent.safe_to_proceed, `missing ${missing}`).toBe(false);
+      expect(r.agent.reasons.join(' ')).toMatch(/security not assessed/);
+    }
+  });
+
+  it('does not score an unreported tax level as 0% tax', () => {
+    // On Robinhood Chain buy_tax/sell_tax come back blank while
+    // slippage_modifiable is populated. Scoring that as a perfect 100 asserted
+    // "no tax detected" about a signal that was never measured.
+    const r = computeScore('0x4444444444444444444444444444444444444444', {
+      ...liveOtherWithHolders,
+      safety: { ...fullyClean, buyTax: null, sellTax: null, slippageModifiable: false },
+    });
+    const tax = r.signals.find(s => s.name === 'tax_analysis');
+    expect(tax.available).toBe(false);
+    expect(tax.value).toBeNull();
+    expect(tax.note).not.toMatch(/no tax detected/);
+  });
+
+  it('never reads SAFE when transfers can be paused or wallets blacklisted', () => {
+    // Both are exit-denial vectors: a honeypot in effect. They only cost graded
+    // points, which a strong read absorbed while still landing above 70.
+    const r = computeScore('0x4444444444444444444444444444444444444444', {
+      ...liveOtherWithHolders,
+      safety: { ...fullyClean, transferPausable: true, isBlacklisted: true },
+    });
+    expect(r.score).toBeGreaterThanOrEqual(70);   // score alone would have said SAFE
+    expect(r.safety).toBe('CAUTION');
+    expect(r.agent.action).toBe('CAUTION');
+    expect(r.agent.safe_to_proceed).toBe(false);
+    expect(r.agent.reasons.join(' ')).toMatch(/paused/);
+    expect(r.agent.reasons.join(' ')).toMatch(/blacklist/);
+  });
+
+  it('keeps the human safety label in lockstep with the agent action', () => {
+    // A weighted average lets a strong read absorb a graded penalty, so the card
+    // could say SAFE while the agent said CAUTION for the same token.
+    const r = computeScore('0x4444444444444444444444444444444444444444', {
+      ...liveOtherWithHolders,
+      safety: { ...fullyClean, slippageModifiable: true },
+    });
+    expect(r.agent.action).toBe('CAUTION');
+    expect(r.safety).not.toBe('SAFE');
+    expect(r.verdict).toMatch(/not confirmed safe/i);
+  });
+
+  it('never reports SAFE while also listing danger reasons', () => {
+    // Backstop invariant across a spread of degraded/dangerous reads: SAFE and a
+    // non-empty reason list must never appear together.
+    const cases = [
+      { ...fullyClean, transferPausable: true },
+      { ...fullyClean, isBlacklisted: true },
+      { ...fullyClean, slippageModifiable: true },
+      { ...fullyClean, hiddenOwner: true },
+      { ...fullyClean, canTakeBackOwnership: true },
+      { ...fullyClean, selfdestruct: true },
+      { ...fullyClean, sellTax: 0.6 },
+      { ...fullyClean, hiddenOwner: null },
+    ];
+    for (const safety of cases) {
+      const r = computeScore('0x4444444444444444444444444444444444444444', {
+        ...liveOtherWithHolders, safety,
+      });
+      if (r.safety === 'SAFE') {
+        expect(r.agent.action, JSON.stringify(safety)).toBe('PROCEED');
+      }
+      if (r.agent.action !== 'PROCEED') {
+        expect(r.safety, JSON.stringify(safety)).not.toBe('SAFE');
+      }
+    }
   });
 });
 
@@ -750,6 +895,39 @@ describe('xbot pollMentions reply flow', () => {
     } finally { restore(); }
   });
 
+  it('survives a malformed tweet id instead of dropping the whole batch', async () => {
+    // BigInt() throws on anything non-numeric. This conversion used to sit
+    // OUTSIDE the per-mention try/catch, so one bad id escaped the loop, dropped
+    // every remaining mention, and left since_id unadvanced — meaning the next
+    // cron cycle re-read the same poison record forever.
+    const kv = makeKV();
+    const { posts, restore } = stubFetch([
+      { id: 'not-a-number', author_id: 'p', text: `scan ${KRILL_ADDR}` },
+      { id: '112', author_id: 'q', text: `scan ${KRILL_ADDR}` },
+    ]);
+    try {
+      const out = await pollMentions(botEnv(kv), deps);
+      expect(out.skippedBadId).toBe(1);
+      expect(out.answered).toBe(1);       // the valid mention still got a reply
+      expect(posts.length).toBe(1);
+      expect(await kv.get('xbot:since_id')).toBe('112'); // checkpoint advanced
+    } finally { restore(); }
+  });
+
+  it('recovers from a corrupt since_id in KV', async () => {
+    // since_id comes from KV, so it is not guaranteed parseable either.
+    const kv = makeKV({ 'xbot:since_id': 'garbage' });
+    const { posts, restore } = stubFetch([
+      { id: '113', author_id: 'r', text: `scan ${KRILL_ADDR}` },
+    ]);
+    try {
+      const out = await pollMentions(botEnv(kv), deps);
+      expect(out.answered).toBe(1);
+      expect(posts.length).toBe(1);
+      expect(await kv.get('xbot:since_id')).toBe('113');
+    } finally { restore(); }
+  });
+
   it('skips cleanly when credentials are missing (no fetch, no throw)', async () => {
     const kv = makeKV();
     const out = await pollMentions({ KRILL_INDEX: kv }, deps);
@@ -979,10 +1157,66 @@ describe('POST /api/xbot/status', () => {
 
 describe('POST /api/xbot/poll', () => {
   it('no-ops cleanly when X credentials are missing (never throws)', async () => {
-    const { res, data } = await call('/xbot/poll', 'POST');
+    const { res, data } = await callEnv({}, '/xbot/poll', 'POST');
     expect(res.status).toBe(200);
     expect(data.ok).toBe(true);
     expect(data.skipped).toBe('x-credentials-missing');
+  });
+});
+
+// These routes cause side effects that outlive the response: real tweets, KV
+// write amplification against a ~1000/day budget, and outbound webhook POSTs.
+// The IP rate limiter is not a control here — it fails OPEN when the Durable
+// Object binding is absent, and 60/min is more than enough to do the damage.
+describe('admin gate on mutating routes', () => {
+  const ADMIN_ROUTES = ['/reindex', '/rediscover', '/watch/check', '/xbot/poll', '/mode'];
+
+  it('rejects every admin route without a key', async () => {
+    for (const route of ADMIN_ROUTES) {
+      const req = new Request(`http://localhost/api${route}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': 'test-admin-suite' },
+        body: '{}',
+      });
+      const res = await worker.fetch(req, { ADMIN_KEY: TEST_ADMIN_KEY });
+      expect(res.status, route).toBe(401);
+      expect((await res.json()).error, route).toBe('unauthorized');
+    }
+  });
+
+  it('rejects a wrong key', async () => {
+    const req = new Request('http://localhost/api/reindex', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Key': 'wrong' },
+      body: '{}',
+    });
+    const res = await worker.fetch(req, { ADMIN_KEY: TEST_ADMIN_KEY });
+    expect(res.status).toBe(401);
+  });
+
+  it('fails closed when ADMIN_KEY is not configured', async () => {
+    // An unset secret must disable the route, not open it to everyone.
+    const req = new Request('http://localhost/api/xbot/poll', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Key': 'anything' },
+      body: '{}',
+    });
+    const res = await worker.fetch(req, {});
+    expect(res.status).toBe(503);
+    expect((await res.json()).error).toBe('admin route disabled');
+  });
+
+  it('leaves the public routes ungated', async () => {
+    // /watch, /check, /score, /ask are user-facing: idempotent or read-only, and
+    // capped. Gating them would break documented agent integrations.
+    const { res } = await callEnv({}, '/check', 'POST', { token: '$KRILL' });
+    expect(res.status).toBe(200);
+    const anon = new Request('http://localhost/api/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': 'test-public-suite' },
+      body: JSON.stringify({ token: '$KRILL' }),
+    });
+    expect((await worker.fetch(anon, {})).status).toBe(200);
   });
 });
 
@@ -1033,13 +1267,24 @@ describe('GET /api/gate', () => {
 
 describe('POST /api/mode', () => {
   it('sets mode to PAUSE', async () => {
-    const { data } = await call('/mode', 'POST', { mode: 'PAUSE' });
+    const { data } = await callEnv({}, '/mode', 'POST', { mode: 'PAUSE' });
     expect(data.mode).toBe('PAUSE');
   });
 
   it('sets mode back to SIGNAL', async () => {
-    const { data } = await call('/mode', 'POST', { mode: 'SIGNAL' });
+    const { data } = await callEnv({}, '/mode', 'POST', { mode: 'SIGNAL' });
     expect(data.mode).toBe('SIGNAL');
+  });
+
+  it('does not 500 on a malformed body', async () => {
+    const req = new Request('http://localhost/api/mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Key': TEST_ADMIN_KEY },
+      body: 'not json',
+    });
+    const res = await worker.fetch(req, { ADMIN_KEY: TEST_ADMIN_KEY });
+    expect(res.status).toBe(200);
+    expect((await res.json()).mode).toBe('SIGNAL');
   });
 });
 
