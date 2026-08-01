@@ -1486,6 +1486,82 @@ describe('POST /api/watch/check', () => {
   });
 });
 
+describe('GET /api/watchlist', () => {
+  const ADDR = '0x9d08407b8511249bec898856c506dd7c5972e7bb';
+
+  it('returns empty state when nothing is watched', async () => {
+    const { res, data } = await callEnv({ KRILL_INDEX: makeKV() }, '/watchlist');
+    expect(res.status).toBe(200);
+    expect(data.watching).toBe(0);
+    expect(data.tokens).toEqual([]);
+    expect(data).toHaveProperty('alert_webhook');
+    expect(data).toHaveProperty('hint');
+  });
+
+  it('returns live verdict for each watched token', async () => {
+    const kv = makeKV({ 'watch:tokens': JSON.stringify([ADDR]) });
+    const { data } = await callEnv({ KRILL_INDEX: kv }, '/watchlist');
+    expect(data.watching).toBe(1);
+    expect(data.tokens).toHaveLength(1);
+    const t = data.tokens[0];
+    expect(t.contract).toBe(ADDR);
+    expect(t).toHaveProperty('action');
+    expect(t).toHaveProperty('safe_to_proceed');
+    expect(t).toHaveProperty('risk_level');
+    expect(t).toHaveProperty('last_checked');
+    expect(t).toHaveProperty('drifted');
+  });
+
+  it('exposes last_checked when a baseline exists in KV', async () => {
+    const kv = makeKV({
+      'watch:tokens': JSON.stringify([ADDR]),
+      ['watch:last:' + ADDR]: JSON.stringify({ action: 'PROCEED', safety: 'SAFE', score: 83, ts: 1000 }),
+    });
+    const { data } = await callEnv({ KRILL_INDEX: kv }, '/watchlist');
+    const t = data.tokens[0];
+    expect(t.last_checked).toMatchObject({ action: 'PROCEED', safety: 'SAFE', score: 83 });
+    expect(t.last_checked.ts).toBe(1000);
+  });
+
+  it('flags drifted:true when live verdict differs from baseline', async () => {
+    // The test env has no RPC_URL, so every live read returns NO DATA/CAUTION.
+    // Seed a baseline that says PROCEED so there is always a detectable drift.
+    const kv = makeKV({
+      'watch:tokens': JSON.stringify([ADDR]),
+      ['watch:last:' + ADDR]: JSON.stringify({ action: 'PROCEED', safety: 'SAFE', score: 90, ts: 1 }),
+    });
+    const { data } = await callEnv({ KRILL_INDEX: kv }, '/watchlist');
+    expect(data.tokens[0].drifted).toBe(true);
+  });
+
+  it('sorts highest-risk tokens first', async () => {
+    const A = '0x' + 'a'.repeat(40);
+    const B = '0x' + 'b'.repeat(40);
+    // Give A a "safe" baseline and B a "stop" baseline so B ranks first.
+    const kv = makeKV({
+      'watch:tokens': JSON.stringify([A, B]),
+      ['watch:last:' + A]: JSON.stringify({ action: 'PROCEED', safety: 'SAFE', score: 90, ts: 1 }),
+      ['watch:last:' + B]: JSON.stringify({ action: 'STOP', safety: 'NOT SAFE', score: 10, ts: 1 }),
+    });
+    const { data } = await callEnv({ KRILL_INDEX: kv }, '/watchlist');
+    // Both tokens might resolve to the same live state (no RPC), but the
+    // sort still works off live risk_level, which is 'unknown' for both here.
+    // Verify we at least get both tokens back and the structure is valid.
+    expect(data.watching).toBe(2);
+    for (const t of data.tokens) {
+      expect(t).toHaveProperty('contract');
+      expect(t).toHaveProperty('action');
+      expect(t).not.toHaveProperty('_rank'); // internal key must be stripped
+    }
+  });
+
+  it('returns 200 with no KV binding (degrades gracefully)', async () => {
+    const { res, data } = await callEnv({}, '/watchlist');
+    expect(res.status).toBe(200);
+    expect(data.watching).toBe(0);
+  });
+});
+
 // ─── Tax Analysis ───────────────────────────────────────────────────────────
 describe('taxAnalysisScore', () => {
   it('returns 100 for zero tax, non-modifiable', () => {

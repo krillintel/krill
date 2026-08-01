@@ -305,6 +305,7 @@ const CACHEABLE_GET = {
   '/score': 15,
   '/batch': 15,
   '/reports': 30,
+  '/watchlist': 10,
   '/compare': 15,
   '/about': 300,
   '/gas': 10,
@@ -2086,6 +2087,87 @@ const routes = {
     return {
       count: reports.length, reports, generatedAt: Date.now(),
       discovered: discovered.length, onChain: reports.length > 0,
+    };
+  },
+
+  // Surveillance watchlist — live verdicts for every token added via POST /watch.
+  // Unlike /reports (which surfaces the discovery feed), this reflects exactly the
+  // tokens an agent or user has asked KRILL to monitor. Each entry includes the
+  // current live score PLUS the last-recorded state from the verdict-change checker
+  // so agents can see at a glance whether anything has drifted since it was last
+  // polled. Sorted by risk severity so the most dangerous token is always first.
+  '/watchlist': async (req, env) => {
+    const list = await getWatchList(env);
+    if (!list.length) {
+      return {
+        watching: 0, tokens: [],
+        alert_webhook: !!env?.ALERT_WEBHOOK_URL,
+        hint: 'Add tokens with POST /api/watch { token }',
+        ts: Date.now(),
+      };
+    }
+
+    const entries = await Promise.all(list.map(async (addr) => {
+      // Live score: what does the chain say right now?
+      let live = null;
+      try {
+        const { disp, r } = await buildCardData(addr, env);
+        live = {
+          token: disp,
+          score: r.score,
+          label: r.label,
+          safety: r.safety,
+          action: r.agent ? r.agent.action : 'NO DATA',
+          safe_to_proceed: r.agent ? r.agent.safe_to_proceed : null,
+          risk_level: r.agent ? r.agent.risk_level : 'unknown',
+          reasons: r.agent ? r.agent.reasons : [],
+          summary: r.agent ? r.agent.summary : null,
+        };
+      } catch { /* keep live null — show baseline only */ }
+
+      // Last recorded state from the verdict-change checker (may lag by up to
+      // the cron interval; shows when the state was last confirmed stable).
+      const baseline = safeParse(await env?.KRILL_INDEX?.get(WATCH_STATE_PREFIX + addr));
+
+      // Risk rank for sort order: STOP/critical first, then high, unknown, low.
+      const riskRank = live ? (RISK_ORDER[live.risk_level] ?? 1) : 1;
+      // Alert flag: the live verdict differs from the last checkpoint.
+      const drifted = baseline && live &&
+        (live.action !== baseline.action || live.safety !== baseline.safety);
+
+      return {
+        contract: addr,
+        token: live ? live.token : addr.slice(0, 6) + '…' + addr.slice(-4),
+        // Live fields (null when the chain is temporarily unreachable)
+        score: live ? live.score : null,
+        label: live ? live.label : null,
+        safety: live ? live.safety : null,
+        action: live ? live.action : 'NO DATA',
+        safe_to_proceed: live ? live.safe_to_proceed : null,
+        risk_level: live ? live.risk_level : 'unknown',
+        reasons: live ? live.reasons : [],
+        summary: live ? live.summary : null,
+        // Checkpoint: last confirmed state from the automated checker
+        last_checked: baseline ? { action: baseline.action, safety: baseline.safety, score: baseline.score, ts: baseline.ts } : null,
+        // `drifted` means the live read disagrees with the checkpoint — the
+        // webhook should have fired, but agents can use this field too.
+        drifted: !!drifted,
+        _rank: riskRank,
+      };
+    }));
+
+    // Sort: highest-risk first, then drifted entries, then by score descending.
+    entries.sort((a, b) =>
+      (b._rank - a._rank) || (b.drifted - a.drifted) || ((b.score ?? -1) - (a.score ?? -1))
+    );
+    // Strip internal sort key before returning.
+    const tokens = entries.map(({ _rank, ...rest }) => rest);
+
+    return {
+      watching: tokens.length,
+      tokens,
+      alert_webhook: !!env?.ALERT_WEBHOOK_URL,
+      ts: Date.now(),
     };
   },
 
