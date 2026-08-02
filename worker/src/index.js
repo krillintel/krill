@@ -1684,6 +1684,23 @@ async function addWatch(env, addr) {
   return { ok: true, watching: list.length };
 }
 
+// Remove a token from the watchlist and drop its checkpoint row, so a later
+// re-add starts from a clean baseline instead of alerting off a stale verdict.
+// Idempotent: removing an unwatched token is a no-op that reports removed:false.
+// Only writes KV when the list actually changes (free-tier write budget).
+async function removeWatch(env, addr) {
+  if (!env?.KRILL_INDEX) return { ok: false, error: 'no KV' };
+  const a = addr.toLowerCase();
+  const list = await getWatchList(env);
+  const next = list.filter(x => x !== a);
+  if (next.length === list.length) return { ok: true, removed: false, watching: list.length };
+  await env.KRILL_INDEX.put(WATCH_LIST_KEY, JSON.stringify(next));
+  // Best-effort checkpoint cleanup — a failed delete must not fail the removal,
+  // since the address is already off the list and will never be checked again.
+  try { await env.KRILL_INDEX.delete(WATCH_STATE_PREFIX + a); } catch { /* orphan row, harmless */ }
+  return { ok: true, removed: true, watching: next.length };
+}
+
 // Fire the configured webhook with an alert payload. Best-effort; never throws.
 async function fireWebhook(env, payload) {
   const urlStr = env?.ALERT_WEBHOOK_URL;
@@ -1834,7 +1851,9 @@ const routes = {
       'GET /api/score': 'full clarity read + agent verdict + signal breakdown (pass ai=0 for the fast deterministic verdict).',
       'GET /api/batch': 'score up to 10 tokens at once — tokens=t1,t2,...',
       'GET /api/token': 'on-chain facts for $KRILL.',
+      'GET /api/watchlist': 'live verdicts for every watched token + drift flags.',
       'POST /api/watch': 'watch a token — fire a webhook when its verdict changes.',
+      'POST /api/unwatch': 'stop watching a token (admin-gated) — also clears its checkpoint.',
     },
     skill: 'https://krill.live/docs/agent-skill.md',
   }),
@@ -2457,7 +2476,7 @@ const routes = {
 // binding is missing or errors, and 60/min is plenty to do the damage above.
 // /watch stays public on purpose — it's a documented user feature, idempotent,
 // and capped at WATCH_MAX entries.
-const ADMIN_ROUTES = new Set(['/reindex', '/rediscover', '/watch/check', '/xbot/poll', '/mode']);
+const ADMIN_ROUTES = new Set(['/reindex', '/rediscover', '/watch/check', '/unwatch', '/xbot/poll', '/mode']);
 
 // Returns a Response when the caller must be rejected, or null to allow.
 // Fails CLOSED: if ADMIN_KEY isn't configured, these routes are unavailable
@@ -2581,6 +2600,18 @@ const postRoutes = {
     if (!isAddress(addr || '')) return { error: 'token must resolve to a contract address (0x… or $KRILL)' };
     const res = await addWatch(env, addr);
     return { ...res, contract: addr, webhook_configured: !!env?.ALERT_WEBHOOK_URL, ts: Date.now() };
+  },
+
+  // Remove a token from the watchlist. POST { token }. Admin-gated: the list is
+  // global and capped at WATCH_MAX, so an open removal endpoint would let anyone
+  // silently stop alerting on a token someone else is monitoring.
+  '/unwatch': async (req, env) => {
+    const b = await req.json().catch(() => ({}));
+    const token = String(b.token || '').trim();
+    const addr = resolveTokenAddress(token);
+    if (!isAddress(addr || '')) return { error: 'token must resolve to a contract address (0x… or $KRILL)' };
+    const res = await removeWatch(env, addr);
+    return { ...res, contract: addr, ts: Date.now() };
   },
 
   // Manual kick for the verdict-change checker (same work the cron does).

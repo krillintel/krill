@@ -190,6 +190,20 @@ export const OPENAPI_SPEC = {
         responses: { 200: { description: 'Watching' }, 400: { description: 'Bad request' } },
       },
     },
+    '/unwatch': {
+      post: {
+        tags: ['alerts'], operationId: 'unwatchToken',
+        summary: 'Stop watching a token (admin)',
+        description: 'Removes a token from the verdict-change watchlist and drops its checkpoint row, so a later re-add starts from a clean baseline instead of alerting off a stale verdict. Idempotent — removing an unwatched token reports removed:false and writes nothing. Requires the X-Admin-Key header: the watchlist is global, so an open removal endpoint would let anyone silently stop alerting on a token someone else is monitoring.',
+        requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/WatchRequest' } } } },
+        responses: {
+          200: { description: 'Removal result — { ok, removed, watching, contract, ts }' },
+          400: { description: 'Bad request' },
+          403: { description: 'Missing or wrong X-Admin-Key' },
+          503: { description: 'ADMIN_KEY not configured — route unavailable (fails closed)' },
+        },
+      },
+    },
     '/about': {
       get: { tags: ['meta'], operationId: 'about', summary: 'Agent identity + self-describing endpoint catalog', responses: { 200: { description: 'About' } } },
     },

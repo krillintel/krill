@@ -127,6 +127,32 @@ your own cadence if you can't accept an inbound webhook.
 
 ---
 
+## Stop watching a token
+
+```
+POST /api/unwatch
+Content-Type: application/json
+X-Admin-Key: <shared secret>
+
+{ "token": "0x9D08407b8511249bec898856C506dD7c5972E7BB" }
+```
+
+```json
+{ "ok": true, "removed": true, "watching": 3, "contract": "0x9d08…e7bb" }
+```
+
+- **Admin-gated.** The watchlist is global and capacity-capped, so an open
+  removal endpoint would let anyone silently disarm a token someone else is
+  monitoring. Send `X-Admin-Key`. Without a configured key the route is
+  unavailable entirely (fail-closed), not merely unauthorized.
+- `removed: false` means the token wasn't on the list — the call is idempotent
+  and writes nothing.
+- Removal also clears the token's stored checkpoint. If you re-add it later, the
+  next check records a fresh silent baseline instead of alerting off a verdict
+  captured before you stopped watching.
+
+---
+
 ## Drop-in: watch a token you just bought (JavaScript)
 
 ```js

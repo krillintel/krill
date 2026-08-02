@@ -1406,6 +1406,67 @@ describe('POST /api/watch', () => {
   });
 });
 
+describe('POST /api/unwatch', () => {
+  const KRILL_ADDR = '0x9d08407b8511249bec898856c506dd7c5972e7bb';
+
+  it('removes a watched token and reports the new count', async () => {
+    const kv = makeKV({ 'watch:tokens': JSON.stringify([KRILL_ADDR, '0x' + '1'.repeat(40)]) });
+    const { res, data } = await callEnv({ KRILL_INDEX: kv }, '/unwatch', 'POST', { token: '$KRILL' });
+    expect(res.status).toBe(200);
+    expect(data.ok).toBe(true);
+    expect(data.removed).toBe(true);
+    expect(data.watching).toBe(1);
+    expect(JSON.parse(await kv.get('watch:tokens'))).not.toContain(KRILL_ADDR);
+  });
+
+  it('drops the checkpoint row so a re-add re-baselines instead of alerting', async () => {
+    const kv = makeKV({
+      'watch:tokens': JSON.stringify([KRILL_ADDR]),
+      ['watch:last:' + KRILL_ADDR]: JSON.stringify({ action: 'PROCEED', safety: 'SAFE', score: 83, ts: 1 }),
+    });
+    await callEnv({ KRILL_INDEX: kv }, '/unwatch', 'POST', { token: KRILL_ADDR });
+    expect(await kv.get('watch:last:' + KRILL_ADDR)).toBe(null);
+  });
+
+  it('is idempotent — removing an unwatched token reports removed:false', async () => {
+    const kv = makeKV({ 'watch:tokens': JSON.stringify(['0x' + '2'.repeat(40)]) });
+    const { data } = await callEnv({ KRILL_INDEX: kv }, '/unwatch', 'POST', { token: '$KRILL' });
+    expect(data.ok).toBe(true);
+    expect(data.removed).toBe(false);
+    expect(data.watching).toBe(1);
+    // untouched list means no KV write was spent on a no-op.
+    expect(JSON.parse(await kv.get('watch:tokens'))).toEqual(['0x' + '2'.repeat(40)]);
+  });
+
+  it('rejects a token that does not resolve to a contract address', async () => {
+    const kv = makeKV({ 'watch:tokens': JSON.stringify([KRILL_ADDR]) });
+    const { data } = await callEnv({ KRILL_INDEX: kv }, '/unwatch', 'POST', { token: 'NOTAREALTOKEN' });
+    expect(data.error).toBeTypeOf('string');
+    expect(data.removed).toBeUndefined();
+    // rejected input leaves the list intact.
+    expect(JSON.parse(await kv.get('watch:tokens'))).toContain(KRILL_ADDR);
+  });
+
+  it('is admin-gated — a request without the admin key cannot remove a token', async () => {
+    const kv = makeKV({ 'watch:tokens': JSON.stringify([KRILL_ADDR]) });
+    const req = new Request('http://localhost/api/unwatch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-Key': 'test-watch-suite' },
+      body: JSON.stringify({ token: '$KRILL' }),
+    });
+    const res = await worker.fetch(req, { ADMIN_KEY: TEST_ADMIN_KEY, KRILL_INDEX: kv });
+    expect(res.status).toBe(401);
+    // the token is still being watched.
+    expect(JSON.parse(await kv.get('watch:tokens'))).toContain(KRILL_ADDR);
+  });
+
+  it('degrades gracefully when no KV is bound', async () => {
+    const { data } = await callEnv({}, '/unwatch', 'POST', { token: '$KRILL' });
+    expect(data.ok).toBe(false);
+    expect(data.error).toBe('no KV');
+  });
+});
+
 describe('POST /api/watch/check', () => {
   it('reports 0 checked when the watchlist is empty', async () => {
     const kv = makeKV();
