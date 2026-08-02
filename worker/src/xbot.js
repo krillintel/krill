@@ -93,13 +93,24 @@ async function oauthHeader(method, baseUrl, params, creds) {
 }
 
 // ── mention parser ──────────────────────────────────────────────────────────
-// Extract the first EVM address from a tweet. Accepts:
-//   "@krillintel scan 0xabc...", "scan 0xabc...", or a bare "0xabc..."
-// Returns the checksummed-as-written 0x string, or null.
+// Extract the scan target from a tweet. Accepts, in priority order:
+//   1. an EVM address — "@krillintel scan 0xabc...", or a bare "0xabc..."
+//   2. a $TICKER — "@krillintel scan $KRILL"
+// Address wins because it is unambiguous. Returns the target string, or null.
+//
+// Tickers matter: without them a tweet like "@krillintel scan $PEPE" parsed to
+// null, and the caller's `|| 'KRILL'` fallback silently replied with a $KRILL
+// card — answering a question nobody asked. A ticker that doesn't resolve
+// on-chain now yields an honest "no on-chain data" reply for that ticker
+// instead of a confident card for the wrong token.
 export function parseScanTarget(text) {
   if (!text) return null;
-  const m = String(text).match(/0x[0-9a-fA-F]{40}\b/);
-  return m ? m[0] : null;
+  const s = String(text);
+  const addr = s.match(/0x[0-9a-fA-F]{40}\b/);
+  if (addr) return addr[0];
+  // Must start with a letter so prices ("$100") aren't read as tickers.
+  const ticker = s.match(/\$([A-Za-z][A-Za-z0-9]{1,9})\b/);
+  return ticker ? '$' + ticker[1] : null;
 }
 
 // True if a tweet is actually asking for a scan (has an address, or the word
@@ -241,6 +252,9 @@ async function markUser(env, authorId, cooldownS) {
 // no hard dependency on the rasterizer (keeps it unit-testable):
 //   deps.renderCardPng(dispToken, scoreResult) -> Uint8Array
 //   deps.buildCardData(rawToken, env) -> { disp, r }  (resolve + score)
+//     `disp` is a display STRING from cardLabel() — "$KRILL", "0x9D08…E7BB" —
+//     not an object. Treating it as one produced a literal "token: clarity …"
+//     in every live reply.
 //   deps.origin -> string (worker origin for link-mode replies)
 export async function pollMentions(env, deps) {
   if (!env.X_BOT_USER_ID || !env.X_BEARER_TOKEN) {
@@ -312,9 +326,10 @@ export async function pollMentions(env, deps) {
 
       const target = parseScanTarget(tw.text) || 'KRILL';
       const { disp, r } = await deps.buildCardData(target, env);
+      const label = disp || 'token';
       const scoreLine = r && r.score != null
-        ? `${disp.symbol || disp.name || 'token'}: clarity ${r.score}/100 · ${r.safety}`
-        : `${disp.symbol || disp.name || 'token'}: no on-chain data indexed yet`;
+        ? `${label}: clarity ${r.score}/100 · ${r.safety}`
+        : `${label}: no on-chain data indexed yet`;
       const replyText = `${scoreLine}\n\nnot financial advice. read the card, verify on-chain. 🦐\nkrill.live/scan?token=${encodeURIComponent(target)}`;
 
       if (replyMode === 'image' && env.X_API_KEY) {

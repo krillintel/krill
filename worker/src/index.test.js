@@ -739,9 +739,13 @@ describe('xbot pollMentions reply flow', () => {
 
   // Minimal deps: buildCardData returns a no-data card (the RPC-less contract),
   // renderCardPng should never be hit in link mode.
+  // `disp` is a display STRING here because that is what the real
+  // buildCardData -> cardLabel() returns. The mock used to hand back an object
+  // ({ symbol: 'KRILL' }), which made the suite pass while every live reply
+  // read "token: clarity 88/100" — the mock was hiding the bug.
   const deps = {
     origin: 'https://krill.live',
-    buildCardData: async () => ({ disp: { symbol: 'KRILL' }, r: { score: null, safety: 'NO DATA' } }),
+    buildCardData: async () => ({ disp: '$KRILL', r: { score: null, safety: 'NO DATA' } }),
     renderCardPng: async () => { throw new Error('renderCardPng should not run in link mode'); },
   };
 
@@ -881,7 +885,7 @@ describe('xbot pollMentions reply flow', () => {
       ...deps,
       buildCardData: async () => {
         if (n++ === 0) throw new Error('boom');
-        return { disp: { symbol: 'KRILL' }, r: { score: null, safety: 'NO DATA' } };
+        return { disp: '$KRILL', r: { score: null, safety: 'NO DATA' } };
       },
     };
     const { posts, restore } = stubFetch([
@@ -932,6 +936,70 @@ describe('xbot pollMentions reply flow', () => {
     const kv = makeKV();
     const out = await pollMentions({ KRILL_INDEX: kv }, deps);
     expect(out.skipped).toBe('x-credentials-missing');
+  });
+
+  // ── reply CONTENT ───────────────────────────────────────────────
+  // Every test above asserts that a reply was SENT. None asserted what it SAID,
+  // which is how the disp-as-object bug shipped: the bot dutifully replied to
+  // everyone with the word "token" where the ticker belonged.
+
+  it('puts the real token label in the reply, never the literal "token"', async () => {
+    const kv = makeKV();
+    const { posts, restore } = stubFetch([
+      { id: '200', author_id: 'u', text: `scan ${KRILL_ADDR}` },
+    ]);
+    try {
+      await pollMentions(botEnv(kv), deps);
+      expect(posts[0].text).toContain('$KRILL');
+      expect(posts[0].text).not.toContain('token:');
+    } finally { restore(); }
+  });
+
+  it('scans the ticker that was asked for, not the $KRILL fallback', async () => {
+    // "@krillintel scan $PEPE" used to parse to null, so the `|| 'KRILL'`
+    // fallback replied with a $KRILL card — a confident answer to a question
+    // nobody asked.
+    const kv = makeKV();
+    const seen = [];
+    const spyDeps = {
+      ...deps,
+      buildCardData: async (target) => {
+        seen.push(target);
+        return { disp: '$PEPE', r: { score: null, safety: 'NO DATA' } };
+      },
+    };
+    const { posts, restore } = stubFetch([
+      { id: '201', author_id: 'u', text: '@krillintel scan $PEPE' },
+    ]);
+    try {
+      const out = await pollMentions(botEnv(kv), spyDeps);
+      expect(out.answered).toBe(1);
+      expect(seen).toEqual(['$PEPE']);
+      expect(posts[0].text).toContain('$PEPE');
+      expect(posts[0].text).not.toContain('$KRILL');
+    } finally { restore(); }
+  });
+});
+
+describe('xbot parseScanTarget', () => {
+  const ADDR = '0x9D08407b8511249bec898856C506dD7c5972E7BB';
+
+  it('prefers an address over a ticker in the same tweet', () => {
+    expect(parseScanTarget(`scan $KRILL ${ADDR}`)).toBe(ADDR);
+  });
+
+  it('extracts a $TICKER when no address is present', () => {
+    expect(parseScanTarget('@krillintel scan $PEPE')).toBe('$PEPE');
+  });
+
+  it('does not read a dollar amount as a ticker', () => {
+    // "$100" / "$4.20" are prices, not tokens — a ticker must start with a letter.
+    expect(parseScanTarget('@krillintel this is going to $100')).toBe(null);
+    expect(parseScanTarget('mcap $4')).toBe(null);
+  });
+
+  it('returns null for a mention with no target at all', () => {
+    expect(parseScanTarget('gm @krillintel love the shrimp')).toBe(null);
   });
 });
 
