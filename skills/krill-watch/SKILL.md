@@ -153,6 +153,50 @@ X-Admin-Key: <shared secret>
 
 ---
 
+## See the timeline: `GET /api/history`
+
+The watchlist tells you what a token is *now*. History tells you *how it got
+there* — the baseline plus every verdict flip KRILL has recorded while the token
+was watched.
+
+```
+GET /api/history?token=0x9D08407b8511249bec898856C506dD7c5972E7BB
+```
+
+```json
+{
+  "contract": "0x9d08…e7bb",
+  "token": "$KRILL",
+  "watching": true,
+  "points": 3,
+  "flips": 1,
+  "first_seen": 1717200000000,
+  "last_change": 1717300000000,
+  "current": { "action": "STOP", "safety": "NOT SAFE", "score": 18 },
+  "timeline": [
+    { "action": "PROCEED", "safety": "SAFE",     "score": 88, "ts": 1717200000000, "baseline": true,  "changed": false },
+    { "action": "STOP",    "safety": "NOT SAFE", "score": 20, "ts": 1717260000000, "baseline": false, "changed": true  },
+    { "action": "STOP",    "safety": "NOT SAFE", "score": 18, "ts": 1717300000000, "baseline": false, "changed": false }
+  ]
+}
+```
+
+- **Read-only, no admin key.** Same token resolution as every other route:
+  `$KRILL` and its `0x…` address hit the same timeline.
+- Points are **oldest-first**. `baseline: true` marks the silent first
+  observation; `changed: true` marks a point whose verdict differs from the one
+  before it — so `flips` counts real transitions, not the baseline.
+- A token only accrues history **while it's on the watchlist**. A never-watched
+  token returns `points: 0` and a `note` telling you to arm it with
+  `POST /api/watch` — it's an empty timeline, not an error.
+- The buffer is capped (most recent points kept), so history is a rolling window
+  of a token's recent verdict life, not an unbounded ledger.
+
+Use it to render the "hour 0 → hour 5" story: a token that launched PROCEED and
+later flipped STOP shows exactly when the rug tension appeared.
+
+---
+
 ## Drop-in: watch a token you just bought (JavaScript)
 
 ```js

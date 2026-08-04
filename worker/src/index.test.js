@@ -1384,7 +1384,7 @@ describe('GET /api/analytics', () => {
 
 describe('removed mock endpoints', () => {
   it.each([
-    '/scan', '/targets', '/hunt', '/profit', '/history',
+    '/scan', '/targets', '/hunt', '/profit',
     '/portfolio', '/pools', '/log', '/twitter', '/watch',
     '/leaderboard', '/config',
   ])('returns 404 for deleted endpoint %s', async (path) => {
@@ -1553,6 +1553,10 @@ describe('POST /api/watch/check', () => {
     const state = await kv.get('watch:last:0x9d08407b8511249bec898856c506dd7c5972e7bb');
     expect(state).toBeTruthy();
     expect(JSON.parse(state)).toHaveProperty('safety');
+    // the timeline is seeded with a single baseline point for /api/history.
+    const hist = JSON.parse(await kv.get('watch:hist:0x9d08407b8511249bec898856c506dd7c5972e7bb'));
+    expect(hist).toHaveLength(1);
+    expect(hist[0]).toMatchObject({ baseline: true });
   });
 
   it('fires the webhook exactly once when a verdict flips, then re-baselines', async () => {
@@ -1583,6 +1587,12 @@ describe('POST /api/watch/check', () => {
       expect(p.from).toMatchObject({ action: 'PROCEED', safety: 'SAFE' });
       expect(p.to).toHaveProperty('safety');
       expect(p.ts).toBeTypeOf('number');
+      // the flip is appended to the token's history timeline (no baseline seed
+      // existed, so this is the first and only recorded point on the flip tick).
+      const hist = JSON.parse(await kv.get('watch:hist:' + addr));
+      expect(hist).toHaveLength(1);
+      expect(hist[0].baseline).toBeFalsy();
+      expect(hist[0]).toHaveProperty('safety');
       // KV was re-baselined to the new verdict, so a second tick is quiet.
       hits.length = 0;
       const second = await callEnv(
@@ -1688,6 +1698,81 @@ describe('GET /api/watchlist', () => {
     const { res, data } = await callEnv({}, '/watchlist');
     expect(res.status).toBe(200);
     expect(data.watching).toBe(0);
+  });
+});
+
+// ─── Verdict history timeline (GET /api/history) ─────────────────────────────
+// History is the time dimension behind the watchlist: the cron seeds a baseline
+// point and appends a snapshot on every verdict flip, keyed watch:hist:<addr>.
+// These tests drive the read route through an in-memory KV to prove it resolves
+// tokens, reads the ring buffer, derives transition metadata, and degrades.
+describe('GET /api/history', () => {
+  const ADDR = '0x9d08407b8511249bec898856c506dd7c5972e7bb'; // resolves from $KRILL
+
+  it('rejects a missing token param', async () => {
+    const { data } = await callEnv({ KRILL_INDEX: makeKV() }, '/history');
+    expect(data.error).toBeTruthy();
+    expect(data).toHaveProperty('example');
+  });
+
+  it('rejects a token that does not resolve to an address', async () => {
+    const { data } = await callEnv({ KRILL_INDEX: makeKV() }, '/history?token=NOTATOKEN');
+    expect(data.error).toBeTruthy();
+    expect(data.token).toBe('NOTATOKEN');
+  });
+
+  it('returns an empty, un-watched timeline for a resolvable token with no history', async () => {
+    const { res, data } = await callEnv({ KRILL_INDEX: makeKV() }, '/history?token=KRILL');
+    expect(res.status).toBe(200);
+    expect(data.contract).toBe(ADDR);
+    expect(data.watching).toBe(false);
+    expect(data.points).toBe(0);
+    expect(data.timeline).toEqual([]);
+    expect(data.current).toBe(null);
+    expect(data.note).toMatch(/not on the watchlist/i);
+  });
+
+  it('resolves a raw 0x address to the same timeline as its ticker', async () => {
+    const { data } = await callEnv({ KRILL_INDEX: makeKV() }, '/history?token=' + ADDR);
+    expect(data.contract).toBe(ADDR);
+  });
+
+  it('returns the recorded timeline oldest-first with transition metadata', async () => {
+    const kv = makeKV({
+      'watch:tokens': JSON.stringify([ADDR]),
+      ['watch:hist:' + ADDR]: JSON.stringify([
+        { action: 'PROCEED', safety: 'SAFE',     score: 88, ts: 1000, baseline: true },
+        { action: 'STOP',    safety: 'NOT SAFE', score: 20, ts: 2000 },
+        { action: 'STOP',    safety: 'NOT SAFE', score: 18, ts: 3000 },
+      ]),
+    });
+    const { data } = await callEnv({ KRILL_INDEX: kv }, '/history?token=KRILL');
+    expect(data.watching).toBe(true);
+    expect(data.points).toBe(3);
+    // First point is the seeded baseline → changed:false; the STOP flip → changed:true;
+    // the third point keeps the same verdict → changed:false. So exactly one flip.
+    expect(data.flips).toBe(1);
+    expect(data.timeline[0]).toMatchObject({ action: 'PROCEED', baseline: true, changed: false });
+    expect(data.timeline[1]).toMatchObject({ action: 'STOP', changed: true });
+    expect(data.timeline[2]).toMatchObject({ action: 'STOP', changed: false });
+    expect(data.first_seen).toBe(1000);
+    expect(data.last_change).toBe(3000);
+    expect(data.current).toMatchObject({ action: 'STOP', safety: 'NOT SAFE', score: 18 });
+  });
+
+  it('reports watching:true with a pending note when watched but no snapshot yet', async () => {
+    const kv = makeKV({ 'watch:tokens': JSON.stringify([ADDR]) });
+    const { data } = await callEnv({ KRILL_INDEX: kv }, '/history?token=KRILL');
+    expect(data.watching).toBe(true);
+    expect(data.points).toBe(0);
+    expect(data.note).toMatch(/awaiting first cron snapshot/i);
+  });
+
+  it('returns 200 with an empty timeline when KV is unbound (degrades gracefully)', async () => {
+    const { res, data } = await callEnv({}, '/history?token=KRILL');
+    expect(res.status).toBe(200);
+    expect(data.points).toBe(0);
+    expect(data.timeline).toEqual([]);
   });
 });
 

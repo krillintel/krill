@@ -306,6 +306,7 @@ const CACHEABLE_GET = {
   '/batch': 15,
   '/reports': 30,
   '/watchlist': 10,
+  '/history': 15,
   '/compare': 15,
   '/about': 300,
   '/gas': 10,
@@ -1663,7 +1664,9 @@ async function getDiscoveredTokens(env) {
 // polling. State is per-token in KV so it survives isolate churn.
 const WATCH_LIST_KEY = 'watch:tokens';       // [addr,…] lowercased, capped
 const WATCH_STATE_PREFIX = 'watch:last:';    // watch:last:<addr> → { action, safety, ts }
+const WATCH_HIST_PREFIX = 'watch:hist:';     // watch:hist:<addr> → [{ action, safety, score, ts }] oldest-first, capped
 const WATCH_MAX = 25;
+const WATCH_HIST_MAX = 20;                   // ring-buffer depth per token
 
 async function getWatchList(env) {
   if (!env?.KRILL_INDEX) return [];
@@ -1701,6 +1704,28 @@ async function removeWatch(env, addr) {
   return { ok: true, removed: true, watching: next.length };
 }
 
+// Append a verdict snapshot to a token's history ring buffer. Oldest-first,
+// capped at WATCH_HIST_MAX so a single token can't grow unbounded in KV. Called
+// only when the cron records a baseline or observes a flip — i.e. exactly when a
+// KV write is already being spent — so history adds no extra write amplification.
+// Best-effort: a history write must never break alerting, so callers ignore throws.
+async function appendHistory(env, addr, entry) {
+  if (!env?.KRILL_INDEX) return;
+  const key = WATCH_HIST_PREFIX + addr.toLowerCase();
+  const hist = safeParse(await env.KRILL_INDEX.get(key), []);
+  const arr = Array.isArray(hist) ? hist : [];
+  arr.push(entry);
+  if (arr.length > WATCH_HIST_MAX) arr.splice(0, arr.length - WATCH_HIST_MAX);
+  await env.KRILL_INDEX.put(key, JSON.stringify(arr));
+}
+
+// Read a token's verdict history (oldest-first). Empty array when none recorded.
+async function getHistory(env, addr) {
+  if (!env?.KRILL_INDEX) return [];
+  const hist = safeParse(await env.KRILL_INDEX.get(WATCH_HIST_PREFIX + addr.toLowerCase()), []);
+  return Array.isArray(hist) ? hist : [];
+}
+
 // Fire the configured webhook with an alert payload. Best-effort; never throws.
 async function fireWebhook(env, payload) {
   const urlStr = env?.ALERT_WEBHOOK_URL;
@@ -1736,7 +1761,10 @@ async function checkVerdictChanges(env) {
       const prev = safeParse(await env.KRILL_INDEX.get(key));
       // First observation: record silently (no alert on the baseline).
       if (!prev) {
-        await env.KRILL_INDEX.put(key, JSON.stringify({ ...cur, ts: Date.now() }));
+        const ts = Date.now();
+        await env.KRILL_INDEX.put(key, JSON.stringify({ ...cur, ts }));
+        // Seed the timeline with the baseline so /api/history has an origin point.
+        try { await appendHistory(env, addr, { ...cur, ts, baseline: true }); } catch { /* history is best-effort */ }
         continue;
       }
       if (prev.action !== cur.action || prev.safety !== cur.safety) {
@@ -1752,7 +1780,11 @@ async function checkVerdictChanges(env) {
         };
         changes.push(alert);
         await fireWebhook(env, alert);
-        await env.KRILL_INDEX.put(key, JSON.stringify({ ...cur, ts: Date.now() }));
+        const ts = Date.now();
+        await env.KRILL_INDEX.put(key, JSON.stringify({ ...cur, ts }));
+        // Record the flip on the token's timeline (best-effort — never abort the
+        // sweep or swallow the alert if the history write fails).
+        try { await appendHistory(env, addr, { ...cur, ts }); } catch { /* history is best-effort */ }
       }
     } catch { /* skip this token this tick */ }
   }
@@ -1852,6 +1884,7 @@ const routes = {
       'GET /api/batch': 'score up to 10 tokens at once — tokens=t1,t2,...',
       'GET /api/token': 'on-chain facts for $KRILL.',
       'GET /api/watchlist': 'live verdicts for every watched token + drift flags.',
+      'GET /api/history': 'verdict timeline for one watched token — baseline + every flip over time.',
       'POST /api/watch': 'watch a token — fire a webhook when its verdict changes.',
       'POST /api/unwatch': 'stop watching a token (admin-gated) — also clears its checkpoint.',
     },
@@ -2186,6 +2219,66 @@ const routes = {
       watching: tokens.length,
       tokens,
       alert_webhook: !!env?.ALERT_WEBHOOK_URL,
+      ts: Date.now(),
+    };
+  },
+
+  // Verdict timeline for a single watched token. The cron records a snapshot on
+  // the baseline and on every verdict flip, so this is the time dimension behind
+  // the watchlist: not just "what is this token now" but "how did it get here".
+  // A token only accrues history while it's on the watchlist (POST /api/watch);
+  // an unwatched or never-watched token returns an empty timeline, not an error.
+  // Usage: /api/history?token=KRILL  or  /api/history?token=0x…
+  '/history': async (req, env) => {
+    const url = new URL(req.url);
+    const raw = (url.searchParams.get('token') || url.searchParams.get('address') || '').trim();
+    if (!raw) return { error: 'provide a token', example: '/api/history?token=KRILL' };
+
+    // Resolve ticker/address → contract with the same synchronous resolver every
+    // other route uses, so /history?token=KRILL and /history?token=0x9D08… key
+    // into the exact same watch:hist:<addr> row the cron writes.
+    const addr = resolveTokenAddress(raw);
+    if (!isAddress(addr || '')) return { error: 'token must resolve to a contract address (0x… or $KRILL)', token: raw };
+
+    const a = addr.toLowerCase();
+    const watching = (await getWatchList(env)).includes(a);
+    const hist = await getHistory(env, addr);
+
+    // Present oldest-first with a human-readable label. Derive lightweight
+    // transition metadata (did safety change vs the prior point?) so a client
+    // can render the timeline without recomputing diffs.
+    let prev = null;
+    const timeline = hist.map((h) => {
+      const changed = prev ? (prev.action !== h.action || prev.safety !== h.safety) : false;
+      const entry = {
+        action: h.action,
+        safety: h.safety,
+        score: h.score ?? null,
+        ts: h.ts,
+        baseline: !!h.baseline,
+        changed,
+      };
+      prev = h;
+      return entry;
+    });
+
+    const first = timeline[0] || null;
+    const last = timeline[timeline.length - 1] || null;
+    return {
+      // Lowercased to match the watchlist route and the watch:hist:<addr> key.
+      contract: a,
+      token: cardLabel(addr, null),
+      watching,
+      points: timeline.length,
+      // How many recorded flips (excludes the seeded baseline point).
+      flips: timeline.filter(t => t.changed).length,
+      first_seen: first ? first.ts : null,
+      last_change: last ? last.ts : null,
+      current: last ? { action: last.action, safety: last.safety, score: last.score } : null,
+      timeline,
+      note: watching
+        ? (timeline.length ? undefined : 'watched, awaiting first cron snapshot')
+        : 'not on the watchlist — add it with POST /api/watch to start recording history',
       ts: Date.now(),
     };
   },

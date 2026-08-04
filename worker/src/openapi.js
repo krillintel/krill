@@ -204,6 +204,20 @@ export const OPENAPI_SPEC = {
         },
       },
     },
+    '/history': {
+      get: {
+        tags: ['alerts'], operationId: 'tokenHistory',
+        summary: 'Verdict timeline for one watched token',
+        description: 'The time dimension behind the watchlist. While a token is watched, the cron seeds a baseline snapshot and appends a point on every verdict flip. Returns those points oldest-first with `changed` transition flags, plus `flips`, `first_seen`, `last_change`, and the `current` verdict. A never-watched token returns an empty timeline (points:0), not an error.',
+        parameters: [
+          { name: 'token', in: 'query', required: true, schema: { type: 'string' }, description: 'Contract address (0x…) or $KRILL.' },
+        ],
+        responses: {
+          200: { description: 'Verdict timeline — { contract, token, watching, points, flips, first_seen, last_change, current, timeline, ts }' },
+          400: { description: 'Missing token or token did not resolve to an address' },
+        },
+      },
+    },
     '/about': {
       get: { tags: ['meta'], operationId: 'about', summary: 'Agent identity + self-describing endpoint catalog', responses: { 200: { description: 'About' } } },
     },
