@@ -2244,6 +2244,13 @@ const routes = {
     const watching = (await getWatchList(env)).includes(a);
     const hist = await getHistory(env, addr);
 
+    // Resolve a friendly label ($SYMBOL) via the shared card builder. This costs
+    // one on-chain read, so it's best-effort: an RPC blip must never break a
+    // history read, and we fall back to the address-derived label.
+    let label;
+    try { label = (await buildCardData(raw, env)).disp; }
+    catch { label = cardLabel(addr, null); }
+
     // Present oldest-first with a human-readable label. Derive lightweight
     // transition metadata (did safety change vs the prior point?) so a client
     // can render the timeline without recomputing diffs.
@@ -2267,7 +2274,7 @@ const routes = {
     return {
       // Lowercased to match the watchlist route and the watch:hist:<addr> key.
       contract: a,
-      token: cardLabel(addr, null),
+      token: label,
       watching,
       points: timeline.length,
       // How many recorded flips (excludes the seeded baseline point).
