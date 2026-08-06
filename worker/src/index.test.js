@@ -2309,3 +2309,139 @@ describe('OpenAPI / docs', () => {
     expect(body).toContain('/api/openapi.json');
   });
 });
+
+// ─── Webhook delivery log ────────────────────────────────────────────────────
+// A verdict-change alert is the only signal a downstream system gets that a token
+// turned dangerous. Before this, a delivery that never landed left no trace: a
+// receiver returning 500, or a stale URL returning 404, was indistinguishable
+// from a delivered alert. These tests pin the outcome recording end-to-end, with
+// the non-2xx case as the one that used to be silent.
+describe('GET /api/deliveries', () => {
+  const ADDR = '0x9d08407b8511249bec898856c506dd7c5972e7bb';
+
+  // Seed a stale checkpoint so /watch/check sees a flip and fires the webhook.
+  const staleKV = () => makeKV({
+    'watch:tokens': JSON.stringify([ADDR]),
+    ['watch:last:' + ADDR]: JSON.stringify({ action: 'PROCEED', safety: 'SAFE', score: 83, ts: 1 }),
+  });
+
+  // Run a verdict-change sweep with fetch stubbed to a fixed webhook outcome.
+  async function sweepWith(kv, responder) {
+    const envKV = { KRILL_INDEX: kv, ALERT_WEBHOOK_URL: 'https://example.com/hook' };
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = responder;
+    try { await callEnv(envKV, '/watch/check', 'POST'); }
+    finally { globalThis.fetch = origFetch; }
+    return envKV;
+  }
+
+  it('reports empty state when no delivery has been attempted', async () => {
+    const { res, data } = await callEnv({ KRILL_INDEX: makeKV() }, '/deliveries');
+    expect(res.status).toBe(200);
+    expect(data.attempts).toBe(0);
+    expect(data.failed).toBe(0);
+    expect(data.deliveries).toEqual([]);
+    expect(data.last_success).toBe(null);
+    expect(data.last_failure).toBe(null);
+    // No webhook configured in this env → nothing to be healthy or unhealthy about.
+    expect(data.alert_webhook).toBe(false);
+    expect(data.healthy).toBe(null);
+    expect(data.hint).toContain('No ALERT_WEBHOOK_URL');
+  });
+
+  it('records a successful delivery', async () => {
+    const kv = staleKV();
+    const envKV = await sweepWith(kv, async () => new Response('ok', { status: 200 }));
+    const { data } = await callEnv(envKV, '/deliveries');
+    expect(data.attempts).toBe(1);
+    expect(data.failed).toBe(0);
+    expect(data.healthy).toBe(true);
+    expect(data.last_success).toBeTypeOf('number');
+    expect(data.last_failure).toBe(null);
+    const d = data.deliveries[0];
+    expect(d.ok).toBe(true);
+    expect(d.status).toBe(200);
+    expect(d.error).toBe(null);
+    expect(d.type).toBe('verdict_change');
+    expect(d.contract).toBe(ADDR);
+    expect(d.ms).toBeTypeOf('number');
+  });
+
+  it('counts a non-2xx reply as a failed delivery', async () => {
+    // The regression this feature exists for: the POST completed, so the old
+    // code reported success and dropped the alert with no trace.
+    const kv = staleKV();
+    const envKV = await sweepWith(kv, async () => new Response('boom', { status: 500 }));
+    const { data } = await callEnv(envKV, '/deliveries');
+    expect(data.attempts).toBe(1);
+    expect(data.failed).toBe(1);
+    expect(data.healthy).toBe(false);
+    expect(data.last_success).toBe(null);
+    expect(data.last_failure).toBeTypeOf('number');
+    expect(data.deliveries[0].ok).toBe(false);
+    expect(data.deliveries[0].status).toBe(500);
+    expect(data.hint).toContain('failed');
+  });
+
+  it('records a transport failure with its error message', async () => {
+    const kv = staleKV();
+    const envKV = await sweepWith(kv, async () => { throw new Error('connection refused'); });
+    const { data } = await callEnv(envKV, '/deliveries');
+    expect(data.failed).toBe(1);
+    expect(data.healthy).toBe(false);
+    const d = data.deliveries[0];
+    expect(d.ok).toBe(false);
+    expect(d.status).toBe(null);
+    expect(d.error).toBe('connection refused');
+  });
+
+  it('never leaks the receiver URL', async () => {
+    const kv = staleKV();
+    const envKV = await sweepWith(kv, async () => new Response('ok', { status: 200 }));
+    const { data } = await callEnv(envKV, '/deliveries');
+    expect(JSON.stringify(data)).not.toContain('example.com');
+  });
+
+  it('keeps the log newest-first and capped', async () => {
+    // Two sweeps, each re-staling the checkpoint so both fire: fail then succeed.
+    const kv = staleKV();
+    await sweepWith(kv, async () => new Response('boom', { status: 500 }));
+    await kv.put('watch:last:' + ADDR, JSON.stringify({ action: 'PROCEED', safety: 'SAFE', score: 83, ts: 1 }));
+    const envKV = await sweepWith(kv, async () => new Response('ok', { status: 200 }));
+
+    const { data } = await callEnv(envKV, '/deliveries');
+    expect(data.attempts).toBe(2);
+    expect(data.failed).toBe(1);
+    // Newest first: the successful second attempt leads, so the hook reads healthy
+    // again even though an older failure is still on the log.
+    expect(data.deliveries[0].status).toBe(200);
+    expect(data.deliveries[1].status).toBe(500);
+    expect(data.healthy).toBe(true);
+    expect(data.last_success).toBeTypeOf('number');
+    expect(data.last_failure).toBeTypeOf('number');
+
+    // Cap holds: a pre-seeded full log stays at WATCH_DELIVERY_MAX (25) entries.
+    const full = Array.from({ length: 25 }, (_, i) => ({ ok: true, status: 200, ts: i }));
+    const kv2 = makeKV({
+      'watch:tokens': JSON.stringify([ADDR]),
+      ['watch:last:' + ADDR]: JSON.stringify({ action: 'PROCEED', safety: 'SAFE', score: 83, ts: 1 }),
+      'watch:delivery': JSON.stringify(full),
+    });
+    const envKV2 = await sweepWith(kv2, async () => new Response('ok', { status: 200 }));
+    const { data: d2 } = await callEnv(envKV2, '/deliveries');
+    expect(d2.attempts).toBe(25);
+  });
+
+  it('does not record anything when no webhook is configured', async () => {
+    // fireWebhook returns early without a URL — no attempt, so no log entry.
+    const kv = staleKV();
+    const origFetch = globalThis.fetch;
+    let called = 0;
+    globalThis.fetch = async () => { called++; return new Response('ok'); };
+    try { await callEnv({ KRILL_INDEX: kv }, '/watch/check', 'POST'); }
+    finally { globalThis.fetch = origFetch; }
+    expect(called).toBe(0);
+    const { data } = await callEnv({ KRILL_INDEX: kv }, '/deliveries');
+    expect(data.attempts).toBe(0);
+  });
+});

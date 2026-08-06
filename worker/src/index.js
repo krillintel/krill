@@ -307,6 +307,7 @@ const CACHEABLE_GET = {
   '/reports': 30,
   '/watchlist': 10,
   '/history': 15,
+  '/deliveries': 10,
   '/compare': 15,
   '/about': 300,
   '/gas': 10,
@@ -1665,8 +1666,10 @@ async function getDiscoveredTokens(env) {
 const WATCH_LIST_KEY = 'watch:tokens';       // [addr,…] lowercased, capped
 const WATCH_STATE_PREFIX = 'watch:last:';    // watch:last:<addr> → { action, safety, ts }
 const WATCH_HIST_PREFIX = 'watch:hist:';     // watch:hist:<addr> → [{ action, safety, score, ts }] oldest-first, capped
+const WATCH_DELIVERY_KEY = 'watch:delivery'; // [{ ok, status, contract, ts }] newest-first, capped
 const WATCH_MAX = 25;
 const WATCH_HIST_MAX = 20;                   // ring-buffer depth per token
+const WATCH_DELIVERY_MAX = 25;               // ring-buffer depth for the delivery log
 
 async function getWatchList(env) {
   if (!env?.KRILL_INDEX) return [];
@@ -1726,18 +1729,57 @@ async function getHistory(env, addr) {
   return Array.isArray(hist) ? hist : [];
 }
 
-// Fire the configured webhook with an alert payload. Best-effort; never throws.
+// Append an outcome to the webhook delivery log. Newest-first, capped at
+// WATCH_DELIVERY_MAX. Only written on a real delivery attempt — i.e. on a verdict
+// flip, when a KV write is already being spent — so it adds no write amplification.
+// Best-effort: a log write must never break alerting, so callers ignore throws.
+async function appendDelivery(env, rec) {
+  if (!env?.KRILL_INDEX) return;
+  const log = safeParse(await env.KRILL_INDEX.get(WATCH_DELIVERY_KEY), []);
+  const arr = Array.isArray(log) ? log : [];
+  arr.unshift(rec);
+  if (arr.length > WATCH_DELIVERY_MAX) arr.length = WATCH_DELIVERY_MAX;
+  await env.KRILL_INDEX.put(WATCH_DELIVERY_KEY, JSON.stringify(arr));
+}
+
+// Read the webhook delivery log (newest-first). Empty array when none recorded.
+async function getDeliveries(env) {
+  if (!env?.KRILL_INDEX) return [];
+  const log = safeParse(await env.KRILL_INDEX.get(WATCH_DELIVERY_KEY), []);
+  return Array.isArray(log) ? log : [];
+}
+
+// Fire the configured webhook with an alert payload, and record the outcome so a
+// silent failure leaves a trace. Best-effort; never throws.
+//
+// A non-2xx response counts as a FAILURE. Previously any completed request was
+// treated as success, so a receiver returning 500 (or a stale URL returning 404)
+// looked identical to a delivered alert — the alert was dropped with nothing to
+// show for it. `ok` now reflects the receiver's own verdict.
 async function fireWebhook(env, payload) {
   const urlStr = env?.ALERT_WEBHOOK_URL;
   if (!urlStr) return false;
+  const started = Date.now();
+  let rec;
   try {
-    await fetch(urlStr, {
+    const res = await fetch(urlStr, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    return true;
-  } catch { return false; }
+    rec = { ok: !!res.ok, status: res.status ?? null, error: null };
+  } catch (e) {
+    // Transport-level failure: DNS, TLS, connection refused, abort.
+    rec = { ok: false, status: null, error: e?.message || 'fetch failed' };
+  }
+  // The receiver URL is deliberately not logged — it's a configured secret, and
+  // the log is readable by any caller who can read the watchlist.
+  rec.type = payload?.type ?? null;
+  rec.contract = payload?.contract ?? null;
+  rec.ms = Date.now() - started;
+  rec.ts = Date.now();
+  try { await appendDelivery(env, rec); } catch { /* log is best-effort */ }
+  return rec.ok;
 }
 
 // Walk the watchlist, recompute each token's deterministic verdict, and fire a
@@ -1885,6 +1927,7 @@ const routes = {
       'GET /api/token': 'on-chain facts for $KRILL.',
       'GET /api/watchlist': 'live verdicts for every watched token + drift flags.',
       'GET /api/history': 'verdict timeline for one watched token — baseline + every flip over time.',
+      'GET /api/deliveries': 'webhook delivery log — did the last alerts actually land?',
       'POST /api/watch': 'watch a token — fire a webhook when its verdict changes.',
       'POST /api/unwatch': 'stop watching a token (admin-gated) — also clears its checkpoint.',
     },
@@ -2219,6 +2262,36 @@ const routes = {
       watching: tokens.length,
       tokens,
       alert_webhook: !!env?.ALERT_WEBHOOK_URL,
+      ts: Date.now(),
+    };
+  },
+
+  // Webhook delivery log. /watch and /watch/check fire outbound alerts, but until
+  // now a failed delivery left no trace: the alert was the only signal a token had
+  // turned dangerous, and if the receiver was down the signal vanished silently.
+  // This exposes the last WATCH_DELIVERY_MAX attempts with their outcome so an
+  // operator can tell "no alerts because nothing changed" apart from "no alerts
+  // because every POST is 500-ing". The receiver URL is never included.
+  '/deliveries': async (req, env) => {
+    const log = await getDeliveries(env);
+    const failed = log.filter(d => !d.ok).length;
+    // The most recent successful delivery is the freshness signal an operator
+    // actually wants: if it's old but failures are recent, the hook is broken.
+    const lastOk = log.find(d => d.ok) || null;
+    const lastFail = log.find(d => !d.ok) || null;
+    return {
+      alert_webhook: !!env?.ALERT_WEBHOOK_URL,
+      attempts: log.length,
+      failed,
+      // Healthy means: a webhook is configured and the newest attempt succeeded.
+      // With no attempts recorded yet there's nothing to be unhealthy about.
+      healthy: !env?.ALERT_WEBHOOK_URL ? null : (log.length === 0 ? null : !!log[0].ok),
+      last_success: lastOk ? lastOk.ts : null,
+      last_failure: lastFail ? lastFail.ts : null,
+      deliveries: log,
+      hint: !env?.ALERT_WEBHOOK_URL
+        ? 'No ALERT_WEBHOOK_URL configured — verdict changes are recorded but never pushed.'
+        : (failed ? 'Some deliveries failed — check the receiver is reachable and returns 2xx.' : undefined),
       ts: Date.now(),
     };
   },

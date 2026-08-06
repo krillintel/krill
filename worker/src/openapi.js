@@ -218,6 +218,16 @@ export const OPENAPI_SPEC = {
         },
       },
     },
+    '/deliveries': {
+      get: {
+        tags: ['alerts'], operationId: 'webhookDeliveries',
+        summary: 'Webhook delivery log — did the alerts actually land?',
+        description: 'Outcome of the most recent verdict-change webhook POSTs, newest-first. A non-2xx reply counts as a failure. Lets an operator distinguish "no alerts because nothing changed" from "no alerts because the receiver is down". `healthy` is null when no webhook is configured or no attempt has been recorded yet. The receiver URL is never returned.',
+        responses: {
+          200: { description: 'Delivery log — { alert_webhook, attempts, failed, healthy, last_success, last_failure, deliveries, ts }' },
+        },
+      },
+    },
     '/about': {
       get: { tags: ['meta'], operationId: 'about', summary: 'Agent identity + self-describing endpoint catalog', responses: { 200: { description: 'About' } } },
     },
