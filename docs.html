@@ -4,11 +4,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>KRILL — Docs</title>
-  <meta name="description" content="How KRILL scores launches: the 5 signals, the 0–100 clarity score, safety verdicts, and the AI agent — all free, no wallet needed.">
+  <meta name="description" content="How KRILL scores launches: the weighted signals, the 0–100 clarity score, safety verdicts, and the AI agent — all free, no wallet needed.">
   <meta name="theme-color" content="#4ade80">
   <link rel="canonical" href="https://krill.live/docs">
   <meta property="og:title" content="KRILL — Docs">
-  <meta property="og:description" content="How KRILL scores launches: 5 signals, 0–100 clarity, safety verdicts, and $KRILL tiers.">
+  <meta property="og:description" content="How KRILL scores launches: weighted on-chain signals, 0–100 clarity, safety verdicts, and $KRILL tiers.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://krill.live/docs">
   <meta property="og:image" content="https://krill.live/assets/krill-scan-card.png">
@@ -86,6 +86,12 @@
     .tbl td { color: var(--ink); }
     .tbl td .w { font-family: var(--mono); color: var(--green); }
     .tbl td.desc { color: var(--mute); }
+    /* Data provenance, inline so the table stays 3 columns and fits narrow screens. */
+    .tbl td .src { display: block; margin-top: 4px; font-family: var(--mono); font-size: 11px; letter-spacing: .5px; color: var(--dim); text-transform: uppercase; }
+    /* Signal names are the literal API field names (holder_distribution, …) so they
+       can be cross-referenced against a /score response. They have no spaces, so
+       without this they set a min-width that overflows narrow screens. */
+    .tbl td:first-child { overflow-wrap: anywhere; }
 
     /* tiers */
     .tiers { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 16px 0; }
@@ -126,7 +132,7 @@
       <p>KRILL turns a messy new token launch into one clear number and a plain-English verdict. No hype, no charts to decode — just a readable signal. Here's exactly how it works.</p>
       <div class="toc">
         <a href="#score">The score</a>
-        <a href="#signals">The 5 signals</a>
+        <a href="#signals">The signals</a>
         <a href="#safety">Safety verdicts</a>
         <a href="#tiers">Access tiers</a>
         <a href="#scan">How to scan</a>
@@ -137,7 +143,7 @@
     <section class="doc" id="score">
       <h2>The clarity score</h2>
       <p>Every launch gets a single <span class="ink">clarity score from 0 to 100</span>. Higher means the launch is easier to read: healthy liquidity, sane holder distribution, and coherent signals. Lower means it's noisy, uneven, or hard to verify.</p>
-      <p>The score is a weighted blend of five signals (below). It's <span class="ink">deterministic</span> — the same token always reads the same way, so you can compare launches fairly instead of chasing a number that jumps around.</p>
+      <p>The score is a weighted blend of the signals below. It's <span class="ink">deterministic</span> — the same token always reads the same way, so you can compare launches fairly instead of chasing a number that jumps around.</p>
       <div class="legend">
         <div class="leg safe">
           <div class="band">70 – 100</div>
@@ -158,19 +164,29 @@
     </section>
 
     <section class="doc" id="signals">
-      <h2>The 5 signals</h2>
-      <p>The score is built from five weighted signals. Liquidity and holder shape carry the most weight because they're the hardest to fake.</p>
+      <h2>The signals</h2>
+      <p>Five signals carry weight. Holder distribution and contract safety carry the most because they're the hardest to fake and the most likely to hide a rug.</p>
       <table class="tbl">
         <thead><tr><th>Signal</th><th>Weight</th><th>What it reads</th></tr></thead>
         <tbody>
-          <tr><td>liquidity path</td><td><span class="w">25%</span></td><td class="desc">Depth and health of the launch's liquidity — can you actually get in and out.</td></tr>
-          <tr><td>holder shape</td><td><span class="w">25%</span></td><td class="desc">Holder count and top-holder concentration. Fewer whales holding a huge % = riskier.</td></tr>
-          <tr><td>social velocity</td><td><span class="w">20%</span></td><td class="desc">Momentum and attention around the launch, relative to its size.</td></tr>
-          <tr><td>contract claims</td><td><span class="w">20%</span></td><td class="desc">How well the contract's promises match its on-chain behavior.</td></tr>
-          <tr><td>narrative fit</td><td><span class="w">10%</span></td><td class="desc">Whether the story is coherent and consistent, not a copy-paste of the last trend.</td></tr>
+          <tr><td>holder_distribution</td><td><span class="w">40</span></td><td class="desc">Holder count and top-holder concentration. A few whales holding a huge % = riskier. <span class="src">on-chain holder indexer</span></td></tr>
+          <tr><td>contract_safety</td><td><span class="w">40</span></td><td class="desc">Honeypot and danger-flag detection — can the token actually be sold. <span class="src">GoPlus</span></td></tr>
+          <tr><td>contract_integrity</td><td><span class="w">20</span></td><td class="desc">Ownership, renouncement, and whether the contract's behavior matches its claims. <span class="src">on-chain RPC</span></td></tr>
+          <tr><td>deployer_reputation</td><td><span class="w">20</span></td><td class="desc">Who launched this, and how many tokens they've spun up before. <span class="src">on-chain deployer history</span></td></tr>
+          <tr><td>tax_analysis</td><td><span class="w">15</span></td><td class="desc">Buy/sell tax, and whether the tax can be changed after launch. <span class="src">GoPlus</span></td></tr>
         </tbody>
       </table>
-      <div class="note">Everything core is <b>free for everyone</b> — the headline score, the full 5-signal breakdown, and the AI-written verdict. No wallet, no signature, no $KRILL required.</div>
+      <p>Weights are relative, not percentages — the score normalizes across the signals that were actually measured. A signal with no data is reported as unmeasured rather than scored as zero, so a missing read can never quietly pass as a clean one.</p>
+      <p><span class="ink">Two hard overrides beat every weight.</span> A confirmed honeypot, or a drain vector like hidden ownership or a ≥50% sell tax, forces NOT SAFE no matter how the rest reads. And if holder distribution or the safety read is missing, the verdict is capped at CAUTION — contract integrity alone never green-lights a token.</p>
+      <table class="tbl">
+        <thead><tr><th>Display-only</th><th>Weight</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>liquidity_depth</td><td><span class="w">0</span></td><td class="desc">Read in your browser from DexScreener, which blocks server-side calls. Shown on the card, but never allowed to move a server-authoritative score.</td></tr>
+          <tr><td>social_velocity</td><td><span class="w">0</span></td><td class="desc">No data source connected. Listed so you can see it isn't secretly influencing the number.</td></tr>
+          <tr><td>narrative_fit</td><td><span class="w">0</span></td><td class="desc">No data source connected.</td></tr>
+        </tbody>
+      </table>
+      <div class="note">Everything core is <b>free for everyone</b> — the headline score, the full signal breakdown, and the AI-written verdict. No wallet, no signature, no $KRILL required.</div>
     </section>
 
     <section class="doc" id="safety">
@@ -191,7 +207,7 @@
         <div class="tier hi">
           <div class="t">PUBLIC</div>
           <div class="min">Free · 0 $KRILL</div>
-          <ul><li>Headline score</li><li>Full 5-signal breakdown</li><li>AI-written verdict</li><li>Ask KRILL agent</li><li>Public watchlist</li></ul>
+          <ul><li>Headline score</li><li>Full signal breakdown</li><li>AI-written verdict</li><li>Ask KRILL agent</li><li>Public watchlist</li></ul>
         </div>
         <div class="tier">
           <div class="t">PRO</div>
@@ -211,7 +227,7 @@
       <h2>How to scan</h2>
       <ul>
         <li>Open the <a href="/">scanner</a> and paste a contract address (<code>0x…</code>), or tap an example chip to try one instantly.</li>
-        <li>Read the clarity score, the safety badge, the full 5-signal breakdown, and the AI verdict — all free, no wallet needed.</li>
+        <li>Read the clarity score, the safety badge, the full signal breakdown, and the AI verdict — all free, no wallet needed.</li>
         <li>Ask the <span class="ink">KRILL agent</span> anything about the launch — it reasons over the live signals in plain English.</li>
         <li>Browse the <span class="ink">public watchlist</span> and filter by Safe / Caution / Not safe. It auto-refreshes live.</li>
       </ul>
@@ -222,7 +238,7 @@
       <h3>Is this financial advice?</h3>
       <p>No. Scores are informational signals about how <em>readable</em> a launch is — not a recommendation to buy or sell. Always do your own research.</p>
       <h3>Do I have to hold $KRILL to use it?</h3>
-      <p>No. The score, the full 5-signal breakdown, the AI verdict, and the Ask KRILL agent are all free for everyone — no token, no wallet, no signature. Holding $KRILL only adds power-user extras like priority scans, custom watchlists, and launch alerts.</p>
+      <p>No. The score, the full signal breakdown, the AI verdict, and the Ask KRILL agent are all free for everyone — no token, no wallet, no signature. Holding $KRILL only adds power-user extras like priority scans, custom watchlists, and launch alerts.</p>
       <h3>Do I need to connect a wallet?</h3>
       <p>Never. Tier checks are read-only balance lookups from a pasted address. KRILL never asks for a signature or transaction.</p>
       <h3>Why does the same token always get the same score?</h3>

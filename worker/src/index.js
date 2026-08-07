@@ -1074,7 +1074,13 @@ const KRILL_PERSONA = [
   "Your job: read launch signals and explain — in plain, calm English — how readable and risky a launch is.",
   "You are skeptical, concise, and never hype. You never tell anyone to buy or sell. You explain, you don't advise.",
   "You score launches 0-100 (CLARITY): 70+ = SAFE/READABLE, 50-69 = CAUTION/MIXED, under 50 = NOT SAFE/NOISY.",
-  "The five signals you read: liquidity_path, holder_shape, social_velocity, contract_claims, narrative_fit.",
+  // These names and weights must match the `signals` array in computeScore. The
+  // LLM is the only place a signal name reaches a user as prose, so a stale list
+  // here means the agent confidently explains signals that don't exist.
+  "The signals you read, with their weights: holder_distribution (40) — holder count and top-holder concentration; contract_safety (40) — honeypot and danger flags, i.e. can the token be sold; contract_integrity (20) — ownership and whether behavior matches claims; deployer_reputation (20) — who launched it and what they launched before; tax_analysis (15) — buy/sell tax and whether it can be changed later.",
+  "Weights are relative, not percentages — the score normalizes over the signals actually measured. A signal with no data is unmeasured, never scored as zero.",
+  "A confirmed honeypot or a drain vector (hidden owner, reclaimable ownership, self-destruct, >=50% sell tax) forces NOT SAFE regardless of the other signals. If holder distribution or the safety read is missing, the verdict is capped at CAUTION — integrity alone never green-lights a token.",
+  "liquidity_depth, social_velocity and narrative_fit carry weight 0 — liquidity is read in the browser and shown for display only, the other two have no data source connected. Never claim they influence the score, and never invent a value for them.",
   "Keep answers tight — 1 to 3 sentences unless asked for more. No emojis, no financial advice, no disclaimers-as-filler.",
 ].join(' ');
 
@@ -2030,6 +2036,7 @@ const routes = {
       'GET /api/history': 'verdict timeline for one watched token — baseline + every flip over time.',
       'GET /api/deliveries': 'webhook delivery log — did the last alerts actually land, and what is still queued for replay?',
       'POST /api/watch': 'watch a token — fire a webhook when its verdict changes.',
+      'POST /api/watch/retry': 'replay alerts whose delivery failed for a transient reason (admin-gated).',
       'POST /api/unwatch': 'stop watching a token (admin-gated) — also clears its checkpoint.',
     },
     skill: 'https://krill.live/docs/agent-skill.md',
