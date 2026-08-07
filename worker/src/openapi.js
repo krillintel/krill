@@ -204,6 +204,16 @@ export const OPENAPI_SPEC = {
         },
       },
     },
+    '/watchlist': {
+      get: {
+        tags: ['alerts'], operationId: 'watchlist',
+        summary: 'Live verdicts for every watched token + drift flags',
+        description: 'One call for the whole monitored portfolio. Each entry carries the live verdict plus `last_checked`, the checkpoint the cron recorded, and `drifted: true` when the two disagree — i.e. the verdict moved since the last sweep. Sorted worst-risk first, so the most dangerous token is always the first element. Live fields are null when the chain is briefly unreachable; the checkpoint still shows.',
+        responses: {
+          200: { description: 'Watchlist — { watching, tokens, alert_webhook, ts }' },
+        },
+      },
+    },
     '/history': {
       get: {
         tags: ['alerts'], operationId: 'tokenHistory',
@@ -224,7 +234,19 @@ export const OPENAPI_SPEC = {
         summary: 'Webhook delivery log — did the alerts actually land?',
         description: 'Outcome of the most recent verdict-change webhook POSTs, newest-first. A non-2xx reply counts as a failure. Lets an operator distinguish "no alerts because nothing changed" from "no alerts because the receiver is down". `healthy` is null when no webhook is configured or no attempt has been recorded yet. The receiver URL is never returned.',
         responses: {
-          200: { description: 'Delivery log — { alert_webhook, attempts, failed, healthy, last_success, last_failure, deliveries, ts }' },
+          200: { description: 'Delivery log — { alert_webhook, attempts, failed, pending, dead, permanent, recovered, healthy, last_success, last_failure, deliveries, ts }' },
+        },
+      },
+    },
+    '/watch/retry': {
+      post: {
+        tags: ['alerts'], operationId: 'retryDeliveries',
+        summary: 'Replay alerts that failed but are still retryable',
+        description: 'Forces the replay sweep the cron runs every ~5 minutes. Re-POSTs stored alerts whose delivery failed transiently (5xx, 429, 408, or no reply at all), updating each log row in place rather than creating a new one. Attempts are capped, after which an entry becomes `dead`; a receiver that rejects the request itself (404, 401, 410) is marked `permanent` and never replayed. Admin-gated because it fires outbound POSTs at the configured receiver.',
+        responses: {
+          200: { description: 'Sweep summary — { ok, retried, delivered, failed, dead, permanent, pending }' },
+          401: { description: 'Missing or wrong X-Admin-Key' },
+          503: { description: 'ADMIN_KEY not configured — route unavailable (fails closed)' },
         },
       },
     },

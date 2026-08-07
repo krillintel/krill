@@ -215,8 +215,7 @@
     if (!force && cached && Date.now() - cached.ts < ttl) return cached.data;
 
     try {
-      const url = path.includes('?') ? `${API_BASE}${path}` : `${API_BASE}${path}`;
-      const res = await fetch(url, {
+      const res = await fetch(`${API_BASE}${path}`, {
         headers: { 'Accept': 'application/json' },
         signal: AbortSignal.timeout(2500),
       });
