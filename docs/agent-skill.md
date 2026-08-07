@@ -95,6 +95,28 @@ GET https://krill-api.gedangefek.workers.dev/api/batch?tokens=<t1>,<t2>,...
 ```
 Each result carries `action` and `safe_to_proceed`.
 
+### After the gate: watch for a flip
+
+A gate check is a point-in-time read. A token that passes now can turn dangerous
+later — a honeypot can appear post-launch. If you hold or keep interacting with a
+token, watch it instead of re-scoring it on a loop:
+
+```
+POST https://krill-api.gedangefek.workers.dev/api/watch
+{ "token": "<TICKER|0xADDRESS>" }
+```
+
+KRILL then POSTs your `ALERT_WEBHOOK_URL` when that token's verdict flips. The
+first observation is a silent baseline, so a POST always means an actual change.
+Delivery is retried on transient failures, which means **the same alert can arrive
+twice** — de-duplicate on `contract` + `ts`.
+
+No webhook? Poll `GET /api/watchlist` for live verdicts and drift flags on
+everything you watch — one request instead of one per token. `GET /api/deliveries`
+shows whether the alerts actually landed.
+
+Full reference: [krill-watch skill](https://krill.live/skills/krill-watch/SKILL.md).
+
 ---
 
 ## Polling politely: rate limits + ETag
@@ -108,8 +130,9 @@ X-RateLimit-Reset      seconds until the window resets
 Anonymous callers get **60 req/min** (keyed by IP). Send an `X-API-Key` header to
 lift the ceiling to **600 req/min**. Over the limit → `429` + `Retry-After`.
 
-Cacheable GETs (`/score`, `/batch`, `/reports`, `/compare`, `/about`, `/gas`,
-`/deploy`) return a weak `ETag` and `Cache-Control`. Send `If-None-Match: <etag>`
+Cacheable GETs (`/score`, `/batch`, `/reports`, `/compare`, `/watchlist`,
+`/history`, `/deliveries`, `/about`, `/gas`, `/deploy`, `/openapi.json`) return a
+weak `ETag` and `Cache-Control`. Send `If-None-Match: <etag>`
 and you'll get a `304 Not Modified` (empty body) when the intelligence hasn't
 changed — the ETag ignores the volatile `ts` field, so identical verdicts share
 an ETag. Cheap polling.
@@ -232,5 +255,7 @@ def krill_gate(token: str) -> bool:
 4. If the API is unreachable, rate-limited (`429`), or returns no verdict, **fail closed** (don't proceed).
 5. Prefer `POST /check` for a yes/no decision; use `/score` when you need the reasons or breakdown.
 6. Respect the rate-limit headers — back off on `429`, or request an `X-API-Key` for a higher ceiling.
-7. KRILL scores what it can verify on-chain. A `PROCEED` is not financial advice —
+7. A pass is not permanent. If you keep holding or interacting, `POST /watch` the
+   token — don't assume a clean gate check stays true.
+8. KRILL scores what it can verify on-chain. A `PROCEED` is not financial advice —
    it means no danger flags were found, not that the token will go up.

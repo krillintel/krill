@@ -81,7 +81,13 @@ Response:
 
 When a watched token's verdict flips, KRILL POSTs a JSON body to the configured
 `ALERT_WEBHOOK_URL`. The **first** observation of a token is a silent baseline —
-no alert — so you only ever get a POST on an *actual change*.
+no alert — so a POST always means an *actual change*.
+
+**Make your handler idempotent.** A change fires once, but a *delivery* can be
+retried: if your receiver doesn't return 2xx, KRILL stores the payload and
+replays it on a later sweep. So the same `verdict_change` body may arrive more
+than once. De-duplicate on `contract` + `ts` — that pair is stable across
+replays of the same alert.
 
 ```json
 {

@@ -185,7 +185,7 @@ export const OPENAPI_SPEC = {
       post: {
         tags: ['alerts'], operationId: 'watchToken',
         summary: 'Watch a token — fire a webhook when its verdict changes',
-        description: 'Adds a token to the verdict-change watchlist. When its action/safety flips (e.g. a honeypot appears post-launch), KRILL POSTs an alert to the configured ALERT_WEBHOOK_URL.',
+        description: 'Adds a token to the verdict-change watchlist. When its action/safety flips (e.g. a honeypot appears post-launch), KRILL POSTs an alert to the configured ALERT_WEBHOOK_URL. Delivery is not fire-and-forget: an attempt that fails for a transient reason (5xx, 429, 408, or no reply at all) is stored and replayed by the cron until it lands or hits the attempt cap, after which it is marked dead. A permanent rejection (404, 401, 410) is never replayed. Because of the replay, your receiver can see the same verdict_change payload more than once — make the handler idempotent. Inspect delivery state via GET /api/deliveries.',
         requestBody: { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/WatchRequest' } } } },
         responses: { 200: { description: 'Watching' }, 400: { description: 'Bad request' } },
       },

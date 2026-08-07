@@ -9,7 +9,7 @@ Launch-intelligence terminal for the Virtuals Protocol ecosystem — scan, score
 [![Live](https://img.shields.io/badge/live-krill.live-14F195?style=flat-square)](https://krill.live)
 [![Chain](https://img.shields.io/badge/chain-Robinhood%204663-8B5CF6?style=flat-square)](https://krill.live)
 [![Cloudflare Workers](https://img.shields.io/badge/API-Cloudflare%20Workers-F38020?style=flat-square&logo=cloudflare&logoColor=white)](https://workers.cloudflare.com)
-[![Tests](https://img.shields.io/badge/tests-31%20passing-3FB950?style=flat-square)](worker/src/index.test.js)
+[![Tests](https://img.shields.io/badge/tests-223%20passing-3FB950?style=flat-square)](worker/src/index.test.js)
 
 </div>
 
@@ -19,7 +19,7 @@ Launch-intelligence terminal for the Virtuals Protocol ecosystem — scan, score
 
 - **Frontend** — static landing page + terminal UI (vanilla JS, no framework)
 - **API** — Cloudflare Worker (`worker/`), reads on-chain data via EVM `eth_*` RPC
-- **Tests** — Vitest (31 unit tests covering all routes)
+- **Tests** — Vitest on `@cloudflare/vitest-pool-workers` (223 unit tests covering every route)
 
 ## Structure
 
@@ -28,7 +28,8 @@ index.html          # landing + terminal UI
 css/                # landing.css, style.css
 js/                 # api.js (client), app.js (terminal logic)
 worker/             # Cloudflare Worker API
-  src/index.js      #   all routes (status, wallet, scan, hunt, ...)
+  src/index.js      #   all routes (check, score, watch, deliveries, ...)
+  src/openapi.js    #   OpenAPI spec served at /api/openapi.json
   src/index.test.js #   Vitest suite
   wrangler.toml     #   Worker config
 ```
