@@ -1670,6 +1670,8 @@ const WATCH_DELIVERY_KEY = 'watch:delivery'; // [{ ok, status, contract, ts }] n
 const WATCH_MAX = 25;
 const WATCH_HIST_MAX = 20;                   // ring-buffer depth per token
 const WATCH_DELIVERY_MAX = 25;               // ring-buffer depth for the delivery log
+const RETRY_MAX_ATTEMPTS = 4;                // total tries per alert (1 original + 3 retries)
+const RETRY_PER_TICK = 5;                    // max alerts replayed per sweep (subrequest budget)
 
 async function getWatchList(env) {
   if (!env?.KRILL_INDEX) return [];
@@ -1749,6 +1751,42 @@ async function getDeliveries(env) {
   return Array.isArray(log) ? log : [];
 }
 
+// POST an alert to the configured receiver. Pure transport: returns the outcome
+// and never logs or throws, so both the first attempt and any later replay share
+// exactly one definition of "did this land".
+async function postWebhook(env, payload) {
+  const started = Date.now();
+  try {
+    const res = await fetch(env.ALERT_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return { ok: !!res.ok, status: res.status ?? null, error: null, ms: Date.now() - started };
+  } catch (e) {
+    // Transport-level failure: DNS, TLS, connection refused, abort.
+    return { ok: false, status: null, error: e?.message || 'fetch failed', ms: Date.now() - started };
+  }
+}
+
+// Is a failed delivery worth trying again?
+//
+// A missing status means the request never got a reply (DNS, TLS, refused) — that
+// is exactly the transient case retrying exists for. 5xx means the receiver is
+// broken right now but the request was well-formed. 429 means slow down, and 408
+// is an explicit timeout.
+//
+// Every other 4xx is the receiver saying the request itself is wrong: 404 on a
+// stale URL, 401 on a rotated secret, 410 on a decommissioned hook. Replaying
+// those just burns subrequests against a receiver that will keep refusing, so we
+// mark them permanent and surface them instead of hammering.
+function isRetryable(status, error) {
+  if (error) return true;
+  if (status === null || status === undefined) return true;
+  if (status === 408 || status === 429) return true;
+  return status >= 500;
+}
+
 // Fire the configured webhook with an alert payload, and record the outcome so a
 // silent failure leaves a trace. Best-effort; never throws.
 //
@@ -1756,30 +1794,93 @@ async function getDeliveries(env) {
 // treated as success, so a receiver returning 500 (or a stale URL returning 404)
 // looked identical to a delivered alert — the alert was dropped with nothing to
 // show for it. `ok` now reflects the receiver's own verdict.
+//
+// A retryable failure also stores the payload, which is what makes replay
+// possible: the alert is the only push signal that a token turned dangerous, so
+// discarding it on the first failed POST loses the signal permanently. Delivered
+// and permanently-failed alerts store no payload — nothing will re-send them.
 async function fireWebhook(env, payload) {
-  const urlStr = env?.ALERT_WEBHOOK_URL;
-  if (!urlStr) return false;
-  const started = Date.now();
-  let rec;
-  try {
-    const res = await fetch(urlStr, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    rec = { ok: !!res.ok, status: res.status ?? null, error: null };
-  } catch (e) {
-    // Transport-level failure: DNS, TLS, connection refused, abort.
-    rec = { ok: false, status: null, error: e?.message || 'fetch failed' };
-  }
+  if (!env?.ALERT_WEBHOOK_URL) return false;
+  const out = await postWebhook(env, payload);
   // The receiver URL is deliberately not logged — it's a configured secret, and
   // the log is readable by any caller who can read the watchlist.
-  rec.type = payload?.type ?? null;
-  rec.contract = payload?.contract ?? null;
-  rec.ms = Date.now() - started;
-  rec.ts = Date.now();
+  const rec = {
+    ok: out.ok, status: out.status, error: out.error,
+    type: payload?.type ?? null,
+    contract: payload?.contract ?? null,
+    ms: out.ms, ts: Date.now(),
+    attempts: 1,
+  };
+  if (out.ok) {
+    rec.state = 'delivered';
+  } else if (isRetryable(out.status, out.error)) {
+    rec.state = 'pending';
+    rec.payload = payload;
+  } else {
+    rec.state = 'permanent';
+  }
   try { await appendDelivery(env, rec); } catch { /* log is best-effort */ }
   return rec.ok;
+}
+
+// Replay alerts that failed but are still worth retrying. This is the other half
+// of the delivery log: knowing an alert was lost is only useful if it can still
+// be delivered. Walks the log newest-first, re-POSTs up to RETRY_PER_TICK pending
+// entries, and updates each in place so one alert keeps one row — a replay is a
+// new attempt on the same event, not a new event.
+//
+// Attempts are capped at RETRY_MAX_ATTEMPTS so a receiver that stays down becomes
+// `dead` instead of being hammered every tick forever. Bounded per tick because
+// each replay is a subrequest, and the cron shares that budget with the indexer
+// and the mention poller.
+//
+// Costs exactly one KV write when something was replayed, and zero when there is
+// nothing pending — the common case, which matters on the ~1000 writes/day tier.
+async function retryFailedDeliveries(env) {
+  if (!env?.KRILL_INDEX) return { skipped: 'no KV' };
+  if (!env?.ALERT_WEBHOOK_URL) return { skipped: 'no webhook configured' };
+  const log = await getDeliveries(env);
+  // Only entries we kept a payload for can be replayed; an older log written
+  // before payloads were stored simply has nothing to send.
+  const pending = log.filter(d => d && d.state === 'pending' && d.payload);
+  if (!pending.length) return { retried: 0, delivered: 0, pending: 0 };
+
+  let delivered = 0, failed = 0, dead = 0, permanent = 0;
+  for (const entry of pending.slice(0, RETRY_PER_TICK)) {
+    const out = await postWebhook(env, entry.payload);
+    entry.attempts = (entry.attempts || 1) + 1;
+    entry.retried_at = Date.now();
+    entry.status = out.status;
+    entry.error = out.error;
+    entry.ms = out.ms;
+    if (out.ok) {
+      // Landed on a later attempt. Drop the payload — it has served its purpose
+      // and there is no reason to keep alert bodies in KV once delivered.
+      entry.ok = true;
+      entry.state = 'delivered';
+      delete entry.payload;
+      delivered++;
+    } else if (!isRetryable(out.status, out.error)) {
+      // The receiver started rejecting the request itself (e.g. the hook was
+      // decommissioned between attempts). Stop trying.
+      entry.state = 'permanent';
+      delete entry.payload;
+      permanent++;
+    } else if (entry.attempts >= RETRY_MAX_ATTEMPTS) {
+      entry.state = 'dead';
+      delete entry.payload;
+      dead++;
+    } else {
+      failed++;
+    }
+  }
+
+  await env.KRILL_INDEX.put(WATCH_DELIVERY_KEY, JSON.stringify(log));
+  return {
+    retried: Math.min(pending.length, RETRY_PER_TICK),
+    delivered, failed, dead, permanent,
+    pending: log.filter(d => d && d.state === 'pending' && d.payload).length,
+  };
 }
 
 // Walk the watchlist, recompute each token's deterministic verdict, and fire a
@@ -1927,7 +2028,7 @@ const routes = {
       'GET /api/token': 'on-chain facts for $KRILL.',
       'GET /api/watchlist': 'live verdicts for every watched token + drift flags.',
       'GET /api/history': 'verdict timeline for one watched token — baseline + every flip over time.',
-      'GET /api/deliveries': 'webhook delivery log — did the last alerts actually land?',
+      'GET /api/deliveries': 'webhook delivery log — did the last alerts actually land, and what is still queued for replay?',
       'POST /api/watch': 'watch a token — fire a webhook when its verdict changes.',
       'POST /api/unwatch': 'stop watching a token (admin-gated) — also clears its checkpoint.',
     },
@@ -2279,19 +2380,44 @@ const routes = {
     // actually wants: if it's old but failures are recent, the hook is broken.
     const lastOk = log.find(d => d.ok) || null;
     const lastFail = log.find(d => !d.ok) || null;
+    // Lifecycle split. `pending` is still queued for replay, `dead` exhausted its
+    // attempts, `permanent` was refused in a way retrying can't fix (404 on a
+    // stale URL, 401 on a rotated secret). The distinction matters: pending will
+    // resolve itself, the other two need someone to look at the receiver.
+    const countState = (s) => log.filter(d => d && d.state === s).length;
+    const pending = countState('pending');
+    const dead = countState('dead');
+    const permanent = countState('permanent');
+    // Alerts that landed only after a replay — evidence the retry path is earning
+    // its keep rather than silently doing nothing.
+    const recovered = log.filter(d => d && d.ok && (d.attempts || 1) > 1).length;
+    // Never expose stored alert bodies here: the log is public, and a payload
+    // could carry more than the summary fields this route is meant to show.
+    const deliveries = log.map(({ payload, ...rest }) => rest);
+
+    let hint;
+    if (!env?.ALERT_WEBHOOK_URL) {
+      hint = 'No ALERT_WEBHOOK_URL configured — verdict changes are recorded but never pushed.';
+    } else if (dead || permanent) {
+      hint = 'Some alerts will never be delivered — check the receiver URL and credentials, then POST /api/watch/retry.';
+    } else if (pending) {
+      hint = 'Failed deliveries are queued for replay — the cron retries them, or POST /api/watch/retry to force it now.';
+    } else if (failed) {
+      hint = 'Some deliveries failed — check the receiver is reachable and returns 2xx.';
+    }
+
     return {
       alert_webhook: !!env?.ALERT_WEBHOOK_URL,
       attempts: log.length,
       failed,
+      pending, dead, permanent, recovered,
       // Healthy means: a webhook is configured and the newest attempt succeeded.
       // With no attempts recorded yet there's nothing to be unhealthy about.
       healthy: !env?.ALERT_WEBHOOK_URL ? null : (log.length === 0 ? null : !!log[0].ok),
       last_success: lastOk ? lastOk.ts : null,
       last_failure: lastFail ? lastFail.ts : null,
-      deliveries: log,
-      hint: !env?.ALERT_WEBHOOK_URL
-        ? 'No ALERT_WEBHOOK_URL configured — verdict changes are recorded but never pushed.'
-        : (failed ? 'Some deliveries failed — check the receiver is reachable and returns 2xx.' : undefined),
+      deliveries,
+      hint,
       ts: Date.now(),
     };
   },
@@ -2644,12 +2770,13 @@ const routes = {
 //                    20 minutes and silently stall the holder indexer
 //   /rediscover    → same KV write amplification
 //   /watch/check   → fires outbound POSTs to ALERT_WEBHOOK_URL (request amplifier)
+//   /watch/retry   → same, replays stored alerts at the receiver
 //   /mode          → mutates process-global state for every request on the isolate
 // The IP rate limiter is not a substitute: it fails OPEN when the Durable Object
 // binding is missing or errors, and 60/min is plenty to do the damage above.
 // /watch stays public on purpose — it's a documented user feature, idempotent,
 // and capped at WATCH_MAX entries.
-const ADMIN_ROUTES = new Set(['/reindex', '/rediscover', '/watch/check', '/unwatch', '/xbot/poll', '/mode']);
+const ADMIN_ROUTES = new Set(['/reindex', '/rediscover', '/watch/check', '/watch/retry', '/unwatch', '/xbot/poll', '/mode']);
 
 // Returns a Response when the caller must be rejected, or null to allow.
 // Fails CLOSED: if ADMIN_KEY isn't configured, these routes are unavailable
@@ -2790,6 +2917,11 @@ const postRoutes = {
   // Manual kick for the verdict-change checker (same work the cron does).
   '/watch/check': async (req, env) => ({ ok: true, ...(await checkVerdictChanges(env)) }),
 
+  // Manual kick for the delivery retry sweep (same work the cron does). Admin-gated
+  // for the same reason as /watch/check: it fires outbound POSTs, so leaving it
+  // open lets anyone amplify requests at the configured receiver.
+  '/watch/retry': async (req, env) => ({ ok: true, ...(await retryFailedDeliveries(env)) }),
+
   // manual kick for the X mention bot (same work the cron does each minute).
   // Useful for verifying credentials + reply flow without waiting for cron.
   '/xbot/poll': async (req, env) => ({
@@ -2835,6 +2967,12 @@ export default {
     // tick so they don't pile up). Only writes KV when a verdict actually flips.
     if (minute % 5 === 2) {
       ctx.waitUntil(checkVerdictChanges(env).catch((e) => console.log('watch check error', String(e).slice(0, 200))));
+    }
+    // Replay alerts that failed but are still retryable. Offset from the verdict
+    // sweep so a receiver that just came back up isn't hit by both at once, and
+    // costs zero KV writes on the common case where nothing is pending.
+    if (minute % 5 === 4) {
+      ctx.waitUntil(retryFailedDeliveries(env).catch((e) => console.log('retry error', String(e).slice(0, 200))));
     }
     ctx.waitUntil(
       pollMentions(env, {

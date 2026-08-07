@@ -197,6 +197,72 @@ later flipped STOP shows exactly when the rug tension appeared.
 
 ---
 
+## Confirm the alert landed: `GET /api/deliveries`
+
+A webhook you never received looks exactly like a quiet market. This route is how
+you tell those apart — the outcome of the most recent alert POSTs, newest-first.
+
+```
+GET /api/deliveries
+```
+
+```json
+{
+  "alert_webhook": true,
+  "attempts": 3,
+  "failed": 1,
+  "healthy": true,
+  "last_success": 1717300000000,
+  "last_failure": 1717260000000,
+  "deliveries": [
+    { "ok": true,  "status": 200, "error": null,                "type": "verdict_change", "contract": "0x9d08…e7bb", "ms": 88,  "ts": 1717300000000 },
+    { "ok": false, "status": 500, "error": null,                "type": "verdict_change", "contract": "0xabc…1234", "ms": 412, "ts": 1717260000000 },
+    { "ok": false, "status": null, "error": "connection refused", "type": "verdict_change", "contract": "0xabc…1234", "ms": 30,  "ts": 1717250000000 }
+  ]
+}
+```
+
+- **A non-2xx reply is a failure.** The POST completing is not the same as the
+  alert landing: a receiver returning 500, or a stale URL returning 404, means
+  the alert was lost. `ok` follows your receiver's own verdict.
+- `status` is the HTTP code; `error` is set instead when the request never got a
+  reply at all (DNS, TLS, refused connection).
+- `healthy` reflects the **newest** attempt. It's `null` — not `false` — when no
+  webhook is configured or nothing has been attempted yet, because there's
+  nothing to judge.
+- Pair `last_success` with `last_failure`: a stale success next to a recent
+  failure is the signature of a receiver that has gone down.
+- **Read-only, no admin key.** The receiver URL is never returned — it's a
+  configured secret.
+
+If `attempts` is 0, no verdict has flipped yet. That's silence with a reason,
+which is different from silence you can't explain.
+
+### A failed alert is not necessarily a lost one
+
+KRILL replays transient failures automatically, so a receiver that was briefly
+down still gets the alert. Every delivery carries a `state`:
+
+| `state` | Meaning | Will it retry? |
+|---|---|---|
+| `delivered` | The receiver returned 2xx. | Done. |
+| `pending` | Failed transiently (5xx, 429, 408, or no reply at all). The alert body is stored. | Yes — the cron sweeps every ~5 min. |
+| `dead` | Retried up to the attempt cap and still failing. | No. |
+| `permanent` | The receiver refused the request itself (404, 401, 410). | No — replaying can't fix a wrong URL or a rotated secret. |
+
+- `attempts` counts every try including the first. An entry with `ok: true` and
+  `attempts > 1` landed on a replay — that's what `recovered` counts.
+- `pending` resolves itself. `dead` and `permanent` need someone to look at the
+  receiver, which is why they're reported separately rather than lumped into
+  `failed`.
+- The distinction is deliberate: a 503 is worth retrying, a 404 never will be.
+  Replaying a stale URL just burns requests against a receiver that keeps
+  refusing.
+- To force a sweep instead of waiting for the cron:
+  `POST /api/watch/retry` (admin-gated — it fires outbound POSTs).
+
+---
+
 ## Drop-in: watch a token you just bought (JavaScript)
 
 ```js

@@ -2380,7 +2380,9 @@ describe('GET /api/deliveries', () => {
     expect(data.last_failure).toBeTypeOf('number');
     expect(data.deliveries[0].ok).toBe(false);
     expect(data.deliveries[0].status).toBe(500);
-    expect(data.hint).toContain('failed');
+    // A 500 is transient, so the alert is queued for replay rather than written off.
+    expect(data.pending).toBe(1);
+    expect(data.hint).toContain('queued for replay');
   });
 
   it('records a transport failure with its error message', async () => {
@@ -2443,5 +2445,193 @@ describe('GET /api/deliveries', () => {
     expect(called).toBe(0);
     const { data } = await callEnv({ KRILL_INDEX: kv }, '/deliveries');
     expect(data.attempts).toBe(0);
+  });
+
+  it('never exposes stored alert payloads', async () => {
+    // A pending entry keeps the alert body so it can be replayed, but /deliveries
+    // is public — the body must not leak through it.
+    const kv = staleKV();
+    const envKV = await sweepWith(kv, async () => new Response('boom', { status: 500 }));
+    const stored = JSON.parse(await kv.get('watch:delivery'));
+    expect(stored[0]).toHaveProperty('payload');   // kept in KV for replay
+    const { data } = await callEnv(envKV, '/deliveries');
+    expect(data.deliveries[0]).not.toHaveProperty('payload');
+  });
+});
+
+// ─── Webhook retry / dead-letter ─────────────────────────────────────────────
+// Knowing an alert was lost is only half the job. These tests pin the replay
+// path: transient failures get retried until they land, permanent rejections
+// don't get hammered, and a receiver that stays down eventually goes dead
+// instead of burning a subrequest every tick forever.
+describe('POST /api/watch/retry', () => {
+  const ADDR = '0x9d08407b8511249bec898856c506dd7c5972e7bb';
+  const HOOK = 'https://example.com/hook';
+
+  const staleKV = () => makeKV({
+    'watch:tokens': JSON.stringify([ADDR]),
+    ['watch:last:' + ADDR]: JSON.stringify({ action: 'PROCEED', safety: 'SAFE', score: 83, ts: 1 }),
+  });
+
+  // Drive a route with fetch stubbed, returning the count of outbound POSTs.
+  async function withFetch(responder, fn) {
+    const origFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async (...args) => { calls++; return responder(...args); };
+    try { await fn(); } finally { globalThis.fetch = origFetch; }
+    return calls;
+  }
+
+  // Produce a log with one pending (retryable) entry from a failed sweep.
+  async function pendingLog(status = 500) {
+    const kv = staleKV();
+    const envKV = { KRILL_INDEX: kv, ALERT_WEBHOOK_URL: HOOK };
+    await withFetch(async () => new Response('boom', { status }), () =>
+      callEnv(envKV, '/watch/check', 'POST'));
+    return { kv, envKV };
+  }
+
+  it('marks a transient failure pending and keeps the payload', async () => {
+    const { kv } = await pendingLog(500);
+    const log = JSON.parse(await kv.get('watch:delivery'));
+    expect(log[0].state).toBe('pending');
+    expect(log[0].attempts).toBe(1);
+    expect(log[0].payload.type).toBe('verdict_change');
+    expect(log[0].payload.contract).toBe(ADDR);
+  });
+
+  it('marks a 404 permanent and stores no payload', async () => {
+    // A stale receiver URL will refuse every replay — retrying is pure waste.
+    const { kv, envKV } = await pendingLog(404);
+    const log = JSON.parse(await kv.get('watch:delivery'));
+    expect(log[0].state).toBe('permanent');
+    expect(log[0]).not.toHaveProperty('payload');
+
+    // The retry sweep must skip it entirely — no outbound request.
+    const calls = await withFetch(async () => new Response('ok'), () =>
+      callEnv(envKV, '/watch/retry', 'POST'));
+    expect(calls).toBe(0);
+    const { data } = await callEnv(envKV, '/deliveries');
+    expect(data.permanent).toBe(1);
+    expect(data.pending).toBe(0);
+  });
+
+  it('replays a pending alert and marks it delivered when it lands', async () => {
+    const { kv, envKV } = await pendingLog(500);
+    const calls = await withFetch(async () => new Response('ok', { status: 200 }), () =>
+      callEnv(envKV, '/watch/retry', 'POST'));
+    expect(calls).toBe(1);
+
+    const log = JSON.parse(await kv.get('watch:delivery'));
+    // One alert stays one row: the replay updates it in place.
+    expect(log).toHaveLength(1);
+    expect(log[0].ok).toBe(true);
+    expect(log[0].state).toBe('delivered');
+    expect(log[0].attempts).toBe(2);
+    expect(log[0].status).toBe(200);
+    expect(log[0].retried_at).toBeTypeOf('number');
+    // Payload dropped once delivered — no reason to keep alert bodies in KV.
+    expect(log[0]).not.toHaveProperty('payload');
+
+    const { data } = await callEnv(envKV, '/deliveries');
+    expect(data.pending).toBe(0);
+    expect(data.recovered).toBe(1);
+    expect(data.healthy).toBe(true);
+  });
+
+  it('goes dead after the attempt cap instead of retrying forever', async () => {
+    const { kv, envKV } = await pendingLog(500);
+    const down = async () => new Response('still down', { status: 503 });
+
+    // Attempt 1 was the original. Three sweeps take it to the cap of 4.
+    let total = 0;
+    for (let i = 0; i < 3; i++) {
+      total += await withFetch(down, () => callEnv(envKV, '/watch/retry', 'POST'));
+    }
+    expect(total).toBe(3);
+
+    const log = JSON.parse(await kv.get('watch:delivery'));
+    expect(log[0].attempts).toBe(4);
+    expect(log[0].state).toBe('dead');
+    expect(log[0]).not.toHaveProperty('payload');
+
+    // A further sweep must not touch the network — the entry is terminal.
+    const after = await withFetch(down, () => callEnv(envKV, '/watch/retry', 'POST'));
+    expect(after).toBe(0);
+
+    const { data } = await callEnv(envKV, '/deliveries');
+    expect(data.dead).toBe(1);
+    expect(data.pending).toBe(0);
+    expect(data.hint).toContain('never be delivered');
+  });
+
+  it('flips a pending entry to permanent if the receiver starts refusing', async () => {
+    // Receiver was 500 (retryable), then got decommissioned → 410.
+    const { kv, envKV } = await pendingLog(500);
+    await withFetch(async () => new Response('gone', { status: 410 }), () =>
+      callEnv(envKV, '/watch/retry', 'POST'));
+    const log = JSON.parse(await kv.get('watch:delivery'));
+    expect(log[0].state).toBe('permanent');
+    expect(log[0].status).toBe(410);
+    expect(log[0]).not.toHaveProperty('payload');
+  });
+
+  it('treats a transport failure as retryable', async () => {
+    const kv = staleKV();
+    const envKV = { KRILL_INDEX: kv, ALERT_WEBHOOK_URL: HOOK };
+    await withFetch(async () => { throw new Error('connection refused'); }, () =>
+      callEnv(envKV, '/watch/check', 'POST'));
+    const log = JSON.parse(await kv.get('watch:delivery'));
+    expect(log[0].state).toBe('pending');
+    expect(log[0].error).toBe('connection refused');
+    expect(log[0].payload).toBeTruthy();
+  });
+
+  it('is a no-op with nothing pending, and writes no KV', async () => {
+    const kv = staleKV();
+    const envKV = { KRILL_INDEX: kv, ALERT_WEBHOOK_URL: HOOK };
+    // A clean delivery leaves nothing to replay.
+    await withFetch(async () => new Response('ok', { status: 200 }), () =>
+      callEnv(envKV, '/watch/check', 'POST'));
+    const before = await kv.get('watch:delivery');
+
+    const calls = await withFetch(async () => new Response('ok'), () =>
+      callEnv(envKV, '/watch/retry', 'POST'));
+    expect(calls).toBe(0);
+    // Byte-identical: the sweep must not spend a write when idle.
+    expect(await kv.get('watch:delivery')).toBe(before);
+  });
+
+  it('reports a skip when no webhook is configured', async () => {
+    const { data } = await callEnv({ KRILL_INDEX: makeKV() }, '/watch/retry', 'POST');
+    expect(data.skipped).toBe('no webhook configured');
+  });
+
+  it('requires an admin key', async () => {
+    // Same gate as /watch/check: the sweep fires outbound POSTs.
+    const req = new Request('http://localhost/api/watch/retry', {
+      method: 'POST',
+      headers: { 'X-API-Key': 'retry-noauth-' + Math.random() },
+    });
+    const res = await worker.fetch(req, { KRILL_INDEX: makeKV(), ADMIN_KEY: 'secret', ALERT_WEBHOOK_URL: HOOK });
+    expect(res.status).toBe(401);
+  });
+
+  it('caps how many alerts it replays in one sweep', async () => {
+    // Eight pending entries, RETRY_PER_TICK is 5 — each sweep is bounded because
+    // every replay is a subrequest shared with the indexer and mention poller.
+    const mk = (i) => ({
+      ok: false, status: 500, error: null, state: 'pending', attempts: 1,
+      type: 'verdict_change', contract: '0x' + String(i).padStart(40, '0'),
+      ms: 10, ts: i, payload: { type: 'verdict_change', contract: '0x' + String(i).padStart(40, '0') },
+    });
+    const kv = makeKV({ 'watch:delivery': JSON.stringify(Array.from({ length: 8 }, (_, i) => mk(i))) });
+    const envKV = { KRILL_INDEX: kv, ALERT_WEBHOOK_URL: HOOK };
+    const calls = await withFetch(async () => new Response('ok', { status: 200 }), () =>
+      callEnv(envKV, '/watch/retry', 'POST'));
+    expect(calls).toBe(5);
+    const { data } = await callEnv(envKV, '/deliveries');
+    expect(data.recovered).toBe(5);
+    expect(data.pending).toBe(3);
   });
 });
