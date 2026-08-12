@@ -351,7 +351,11 @@
       }
     })();
 
-    // Live scan feed — poll /hunt endpoint and render event stream
+    // Live scan feed — poll /reports and render the scored discovery feed as an
+    // event stream. /reports returns { reports: [{ token, address, score, label,
+    // decision, safety }] }: the freshly discovered launches, scored on the same
+    // engine as /score. Deduped on address+score, so a re-score at an unchanged
+    // score is silent and only an actual move produces a new row.
     (function () {
       const stream = document.getElementById('feedStream');
       const countEl = document.getElementById('feedCount');
@@ -370,18 +374,13 @@
       }
 
       function renderEvent(ev) {
-        const key = `${ev.ts}|${ev.text}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
+        if (seen.has(ev.key)) return false;
+        seen.add(ev.key);
         if (seen.size > 300) seen.clear(); // keep the set bounded
 
         const row = document.createElement('div');
         row.className = 'feed-event';
-        const kind = ev.kind === 'success' ? ' success' :
-                     ev.kind === 'warn'    ? ' warn' :
-                     ev.kind === 'error'   ? ' error' :
-                     /warn|risk|caution/i.test(ev.text) ? ' warn' :
-                     /error|fail|reject/i.test(ev.text) ? ' error' : '';
+        const kind = ev.kind ? ' ' + ev.kind : '';
         row.innerHTML = `<span class="feed-event-ts">${esc(ev.ts)}</span><span class="feed-event-text${kind}">${esc(ev.text)}</span>`;
         stream.prepend(row);
 
@@ -391,18 +390,44 @@
         return true;
       }
 
+      // decision is the scorer's own call: SIGNAL >= 70, SCAN >= 50, else SKIP.
+      // SKIP also covers the hard overrides (HONEYPOT / DANGER), which is why it
+      // reads as an error rather than a warning.
+      function kindFor(r) {
+        if (r.decision === 'SIGNAL') return 'success';
+        if (r.decision === 'SCAN') return 'warn';
+        if (r.decision === 'SKIP') return 'error';
+        return '';
+      }
+
       async function pollFeed() {
         try {
-          const res = await fetch(`${API_BASE}/hunt`);
+          const res = await fetch(`${API_BASE}/reports?limit=8`);
           if (!res.ok) throw new Error('feed unavailable');
           const data = await res.json();
-          const events = Array.isArray(data.events) ? data.events : [];
+          const reports = Array.isArray(data.reports) ? data.reports : [];
 
           const placeholder = stream.querySelector('.feed-placeholder');
-          if (placeholder && events.length) placeholder.remove();
+          if (placeholder && reports.length) placeholder.remove();
+
+          // Observation time is local: /reports says what a token scores now, not
+          // when it was seen, so stamping it client-side is the honest read.
+          const ts = new Date().toTimeString().slice(0, 8);
+
+          // Weakest first, so the strongest read lands on top after prepend().
+          const ordered = reports.slice().sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
 
           let added = 0;
-          events.forEach(ev => { if (renderEvent(ev)) added++; });
+          ordered.forEach(r => {
+            const score = r.score == null ? '—' : `${r.score}/100`;
+            const ev = {
+              key: `${r.address}|${r.score}`,
+              ts,
+              text: `${r.token}  ${score}  ${r.decision}${r.safety ? ' · ' + r.safety : ''}`,
+              kind: kindFor(r),
+            };
+            if (renderEvent(ev)) added++;
+          });
           if (added) { scanCount += added; countEl.textContent = `${scanCount} events`; }
           statusEl.style.opacity = '1';
         } catch (e) {
@@ -413,7 +438,9 @@
       }
 
       pollFeed();
-      setInterval(pollFeed, 10000); // poll every 10s
+      // /reports is cached for 30s server-side, so polling faster just re-reads
+      // the same response.
+      setInterval(pollFeed, 30000);
     })();
 
     (function () {
